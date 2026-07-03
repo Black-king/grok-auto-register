@@ -1,6 +1,6 @@
 <div align="center">
 
-[![Grok Register — GUI and CLI registration automation toolkit](assets/banner.svg)](https://github.com/AaronL725/grok-register)
+[![Grok Register — GUI and CLI registration automation toolkit](assets/banner.png)](https://github.com/AaronL725/grok-register)
 
 Grok Register 是一个面向自动化流程研究、测试环境验证和个人学习的 Python 自动化注册工具 — 支持 GUI / CLI、临时邮箱、浏览器流程控制、账号输出和 grok2api token 池写入。
 
