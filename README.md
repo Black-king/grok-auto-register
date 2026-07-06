@@ -86,13 +86,39 @@ cp config.example.json config.json
 | `proxy` | 代理地址，可留空 |
 | `enable_nsfw` | 注册后是否尝试开启 NSFW |
 | `cloudflare_api_base` | Cloudflare 临时邮箱 API 地址 |
-| `cloudflare_auth_mode` | Cloudflare API 鉴权模式：`none`、`bearer`、`x-api-key`、`query-key` |
+| `cloudflare_api_key` | Cloudflare 临时邮箱接口密钥；admin 模式填 `ADMIN_PASSWORD` |
+| `cloudflare_auth_mode` | Cloudflare API 鉴权模式：`none`、`bearer`、`x-api-key`、`x-admin-auth`、`query-key` |
+| `cloudflare_path_accounts` | Cloudflare 创建邮箱路径；匿名模式用 `/api/new_address`，admin 模式用 `/admin/new_address` |
 | `defaultDomains` | Cloudflare 临时邮箱默认域名 |
 | `grok2api_auto_add_local` | 是否写入本地 grok2api token 池 |
 | `grok2api_local_token_file` | 本地 grok2api token 文件路径 |
 | `grok2api_auto_add_remote` | 是否写入远端 grok2api |
-| `grok2api_remote_base` | 远端 grok2api 管理 API 地址 |
+| `grok2api_remote_base` | 远端 grok2api 地址，可填站点根地址或 `/admin/api` 管理 API 地址 |
 | `grok2api_remote_app_key` | 远端 grok2api app key |
+
+### Cloudflare 临时邮箱 admin 模式
+
+如果使用 `dreamhunter2333/cloudflare_temp_email` 且匿名 `/api/new_address` 开启了 Turnstile，可以改用 admin 创建邮箱接口：
+
+```json
+{
+  "email_provider": "cloudflare",
+  "cloudflare_api_base": "https://你的-worker-api-域名",
+  "cloudflare_api_key": "你的 ADMIN_PASSWORD",
+  "cloudflare_auth_mode": "x-admin-auth",
+  "cloudflare_path_accounts": "/admin/new_address",
+  "cloudflare_path_messages": "/api/mails",
+  "defaultDomains": "你的收信域名.com"
+}
+```
+
+创建邮箱会使用 `x-admin-auth` 调用 `/admin/new_address`，后续收件仍使用接口返回的地址 JWT 调用 `/api/mails`。
+
+可先用调试脚本验证 admin 创建接口：
+
+```bash
+python cf_mail_debug.py --api-base "https://你的-worker-api-域名" --auth-mode x-admin-auth --api-key "你的 ADMIN_PASSWORD" --create-path /admin/new_address --domain "你的收信域名.com"
+```
 
 `config.json` 包含个人配置和密钥，不要提交到 Git。
 

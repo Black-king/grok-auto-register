@@ -3,6 +3,8 @@
 
 import argparse
 import re
+import secrets
+import string
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -36,21 +38,72 @@ def json_or_text(resp: requests.Response) -> Tuple[Optional[Dict[str, Any]], str
         return None, (resp.text or "")[:400]
 
 
-def create_address(api_base: str) -> Tuple[str, str]:
+def generate_username(length: int = 10) -> str:
+    """生成 cloudflare_temp_email admin API 需要的随机邮箱名称。"""
+    chars = string.ascii_lowercase + string.digits
+    return "".join(secrets.choice(chars) for _ in range(length))
+
+
+def normalize_path(path: str, default_path: str) -> str:
+    """标准化 API 路径，避免漏写开头斜杠。"""
+    raw = (path or default_path).strip() or default_path
+    return raw if raw.startswith("/") else f"/{raw}"
+
+
+def build_auth_headers(auth_mode: str, api_key: str, content_type: bool = False) -> Dict[str, str]:
+    """按调试参数构造 Cloudflare 临时邮箱接口鉴权请求头。"""
+    headers = {"Content-Type": "application/json"} if content_type else {}
+    key = (api_key or "").strip()
+    mode = (auth_mode or "none").strip().lower()
+    if not key:
+        return headers
+    if mode == "x-admin-auth":
+        headers["x-admin-auth"] = key
+    elif mode == "x-api-key":
+        headers["X-API-Key"] = key
+    elif mode == "bearer":
+        headers["Authorization"] = f"Bearer {key}"
+    return headers
+
+
+def create_address(
+    api_base: str,
+    auth_mode: str = "none",
+    api_key: str = "",
+    create_path: str = "/api/new_address",
+    domain: str = "",
+    name: str = "",
+) -> Tuple[str, str]:
+    """创建 Cloudflare 临时邮箱地址，支持匿名 API 和 admin API。"""
+    path = normalize_path(create_path, "/api/new_address")
+    is_admin_create = path.rstrip("/").lower() == "/admin/new_address"
+    if is_admin_create:
+        payload: Dict[str, Any] = {
+            "name": name.strip() if name.strip() else generate_username(),
+            "enablePrefix": True,
+        }
+        if domain.strip():
+            payload["domain"] = domain.strip()
+        headers = build_auth_headers(auth_mode, api_key, content_type=True)
+    else:
+        payload = {}
+        if domain.strip():
+            payload["domain"] = domain.strip()
+        headers = {"Content-Type": "application/json"}
     resp = requests.post(
-        f"{api_base.rstrip('/')}/api/new_address",
-        json={},
-        headers={"Content-Type": "application/json"},
+        f"{api_base.rstrip('/')}{path}",
+        json=payload,
+        headers=headers,
         timeout=20,
     )
     resp.raise_for_status()
     data, raw = json_or_text(resp)
     if not data:
-        raise RuntimeError(f"/api/new_address 非JSON: {raw}")
+        raise RuntimeError(f"{path} 非JSON: {raw}")
     address = str(data.get("address", "")).strip()
     jwt = str(data.get("jwt", "")).strip()
     if not address or not jwt:
-        raise RuntimeError(f"/api/new_address 缺少 address/jwt: {data}")
+        raise RuntimeError(f"{path} 缺少 address/jwt: {data}")
     return address, jwt
 
 
@@ -131,6 +184,11 @@ def main():
     ap.add_argument("--api-base", required=True)
     ap.add_argument("--address", default="")
     ap.add_argument("--credential", default="")
+    ap.add_argument("--auth-mode", default="none", choices=["none", "bearer", "x-api-key", "x-admin-auth"])
+    ap.add_argument("--api-key", default="")
+    ap.add_argument("--create-path", default="/api/new_address")
+    ap.add_argument("--domain", default="")
+    ap.add_argument("--name", default="")
     ap.add_argument("--timeout", type=int, default=180)
     ap.add_argument("--interval", type=int, default=3)
     args = ap.parse_args()
@@ -138,7 +196,14 @@ def main():
     address = args.address.strip()
     credential = args.credential.strip()
     if not credential:
-        address, credential = create_address(args.api_base)
+        address, credential = create_address(
+            args.api_base,
+            auth_mode=args.auth_mode,
+            api_key=args.api_key,
+            create_path=args.create_path,
+            domain=args.domain,
+            name=args.name,
+        )
         print(f"[NEW] address={address}")
         print(f"[NEW] credential(jwt)={credential}")
     else:

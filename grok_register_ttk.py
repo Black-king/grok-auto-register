@@ -174,6 +174,8 @@ def cloudflare_build_headers(content_type=False):
     if key:
         if mode == "x-api-key":
             headers["X-API-Key"] = key
+        elif mode == "x-admin-auth":
+            headers["x-admin-auth"] = key
         elif mode != "none":
             headers["Authorization"] = f"Bearer {key}"
     return headers
@@ -186,6 +188,22 @@ def cloudflare_apply_auth_params(params=None):
     if key and mode == "query-key":
         merged["key"] = key
     return merged
+
+
+def cloudflare_next_default_domain():
+    """按配置轮换选择 Cloudflare 临时邮箱域名。"""
+    global _cf_domain_index
+    domains = [x.strip() for x in str(config.get("defaultDomains", "") or "").split(",") if x.strip()]
+    if not domains:
+        return ""
+    domain = domains[_cf_domain_index % len(domains)]
+    _cf_domain_index += 1
+    return domain
+
+
+def cloudflare_is_admin_create_path(path):
+    """判断当前创建邮箱路径是否为 cloudflare_temp_email 管理员创建接口。"""
+    return str(path or "").rstrip("/").lower() == "/admin/new_address"
 
 
 def _pick_list_payload(data):
@@ -208,19 +226,22 @@ def _pick_list_payload(data):
 
 
 def cloudflare_create_temp_address(api_base):
-    """适配 cloudflare_temp_email v1.8.x: POST /api/new_address -> {address,jwt}"""
-    global _cf_domain_index
-    url = f"{api_base}/api/new_address"
-    payload = {}
-    try:
-        # 在多个域名之间轮换，降低单域偶发不收件导致的失败率
-        domains = [x.strip() for x in str(config.get("defaultDomains", "") or "").split(",") if x.strip()]
-        if domains:
-            payload["domain"] = domains[_cf_domain_index % len(domains)]
-            _cf_domain_index += 1
-    except Exception:
-        pass
-    resp = http_post(url, json=payload, headers={"Content-Type": "application/json"})
+    """适配 cloudflare_temp_email 新建地址接口并兼容 admin 创建模式。"""
+    path = get_cloudflare_path("cloudflare_path_accounts", "/api/new_address")
+    url = f"{api_base}{path}"
+    domain = cloudflare_next_default_domain()
+    is_admin_create = cloudflare_is_admin_create_path(path)
+    if is_admin_create:
+        payload = {"name": generate_username(10), "enablePrefix": True}
+        if domain:
+            payload["domain"] = domain
+        headers = cloudflare_build_headers(content_type=True)
+    else:
+        payload = {}
+        if domain:
+            payload["domain"] = domain
+        headers = {"Content-Type": "application/json"}
+    resp = http_post(url, json=payload, headers=headers)
     resp.raise_for_status()
     try:
         data = resp.json()
@@ -295,6 +316,35 @@ def add_token_to_grok2api_local_pool(raw_token, email="", log_callback=None):
     return True
 
 
+def get_grok2api_remote_api_bases(base):
+    """生成 grok2api 管理 API 候选根路径。
+
+    参数:
+      - base str: 用户配置的 grok2api 远端地址
+
+    返回:
+      - list[str]: 依次尝试的管理 API 根路径
+    """
+    normalized = str(base or "").strip().rstrip("/")
+    if not normalized:
+        return []
+    lower = normalized.lower()
+    candidates = [normalized]
+    if lower.endswith("/admin/api"):
+        return candidates
+    if lower.endswith("/admin"):
+        candidates.append(f"{normalized}/api")
+    else:
+        candidates.append(f"{normalized}/admin/api")
+    seen = set()
+    unique = []
+    for item in candidates:
+        if item not in seen:
+            unique.append(item)
+            seen.add(item)
+    return unique
+
+
 def add_token_to_grok2api_remote_pool(raw_token, email="", log_callback=None):
     token = _normalize_sso_token(raw_token)
     if not token:
@@ -310,24 +360,29 @@ def add_token_to_grok2api_remote_pool(raw_token, email="", log_callback=None):
     query = {"app_key": app_key}
     pool_map = {"ssoBasic": "basic", "ssoSuper": "super"}
     remote_pool = pool_map.get(pool_name, "basic")
+    api_bases = get_grok2api_remote_api_bases(base)
+    add_errors = []
     # 优先使用 add 接口，避免全量覆盖远端池
-    try:
-        add_payload = {"tokens": [token], "pool": remote_pool, "tags": ["auto-register"]}
-        resp_add = http_post(
-            f"{base}/tokens/add",
-            headers=headers,
-            params=query,
-            json=add_payload,
-            timeout=30,
-            proxies={},
-        )
-        resp_add.raise_for_status()
-        if log_callback:
-            log_callback(f"[+] 已写入 grok2api 远端池: {pool_name} ({base}/tokens/add)")
-        return True
-    except Exception as add_exc:
-        if log_callback:
-            log_callback(f"[Debug] /tokens/add 写入失败，尝试 /tokens 全量模式: {add_exc}")
+    add_payload = {"tokens": [token], "pool": remote_pool, "tags": ["auto-register"]}
+    for api_base in api_bases:
+        endpoint = f"{api_base}/tokens/add"
+        try:
+            resp_add = http_post(
+                endpoint,
+                headers=headers,
+                params=query,
+                json=add_payload,
+                timeout=30,
+                proxies={},
+            )
+            resp_add.raise_for_status()
+            if log_callback:
+                log_callback(f"[+] 已写入 grok2api 远端池: {pool_name} ({endpoint})")
+            return True
+        except Exception as add_exc:
+            add_errors.append(f"{endpoint}: {add_exc}")
+    if log_callback:
+        log_callback(f"[Debug] /tokens/add 写入失败，尝试 /tokens 全量模式: {'; '.join(add_errors)}")
 
     # 兜底：旧版全量保存接口
     current = {}
@@ -2480,7 +2535,7 @@ class GrokRegisterGUI:
         add_label(2, 2, "Cloudflare 鉴权模式:")
         self.cloudflare_auth_mode_var = tk.StringVar(value=config.get("cloudflare_auth_mode", "bearer"))
         self.cloudflare_auth_mode_combo = tk_option_menu(
-            config_frame, self.cloudflare_auth_mode_var, ["query-key", "bearer", "x-api-key", "none"], width=12
+            config_frame, self.cloudflare_auth_mode_var, ["query-key", "bearer", "x-api-key", "x-admin-auth", "none"], width=12
         )
         add_field(self.cloudflare_auth_mode_combo, 2, 3, sticky=tk.W)
 
@@ -2989,4 +3044,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
