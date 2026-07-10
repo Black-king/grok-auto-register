@@ -1,5 +1,7 @@
 {
   "duckmail_api_key": "",
+  "templol_api_key": "",
+  "templol_domains": "",
   "cloudflare_api_base": "https://temp-mail.example.com",
   "cloudflare_api_key": "",
   "cloudflare_auth_mode": "none",
@@ -18,7 +20,7 @@
   "grok2api_remote_base": "",
   "grok2api_remote_app_key": "",
   "defaultDomains": "example.com",
-  "email_provider": "cloudflare",
+  "email_provider": "templol",
   "yyds_api_key": "",
   "yyds_jwt": "",
   "cpa_export_enabled": true,

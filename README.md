@@ -49,7 +49,7 @@ Grok Register 是一个面向自动化流程研究、测试环境验证和个人
 - 支持 GUI 图形界面运行。
 - 支持 CLI 终端运行，不启动 Tk GUI。
 - 注册流程使用 Chromium/Chrome 浏览器页面完成。
-- 支持 DuckMail、YYDS、Cloudflare 临时邮箱接口。
+- 支持 TempMail.lol、DuckMail、YYDS、Cloudflare 临时邮箱接口。
 - 支持验证码邮件轮询和解析。
 - 支持成功账号实时写入 `accounts_*.txt`。
 - 支持将 SSO token 写入 grok2api 本地或远端池。
@@ -91,7 +91,9 @@ cp config.example.json config.json
 
 | 配置项 | 说明 |
 | --- | --- |
-| `email_provider` | 邮箱服务商：`duckmail`、`yyds`、`cloudflare` |
+| `email_provider` | 邮箱服务商：`templol`、`duckmail`、`yyds`、`cloudflare` |
+| `templol_api_key` | TempMail.lol API Key；免费匿名模式留空，付费/自定义域名时填写 |
+| `templol_domains` | TempMail.lol 自定义域名，逗号分隔；支持 `*.example.com` 通配自动生成子域名；留空则用官方随机域名 |
 | `register_count` | 本次目标注册数量 |
 | `proxy` | 代理地址，可留空 |
 | `enable_nsfw` | 注册后是否尝试开启 NSFW |
@@ -108,6 +110,30 @@ cp config.example.json config.json
 | `grok2api_auto_add_remote` | 是否写入远端 grok2api |
 | `grok2api_remote_base` | 远端 grok2api 地址，可填站点根地址或 `/admin/api` 管理 API 地址 |
 | `grok2api_remote_app_key` | 远端 grok2api app key |
+
+### TempMail.lol 临时邮箱（推荐，默认零配置）
+
+TempMail.lol 支持匿名创建邮箱，无需任何密钥或域名即可使用，是最省事的路线。保持下面配置即可：
+
+```json
+{
+  "email_provider": "templol",
+  "templol_api_key": "",
+  "templol_domains": ""
+}
+```
+
+程序会调用 `POST https://api.tempmail.lol/v2/inbox/create` 创建邮箱，并通过 `GET https://api.tempmail.lol/v2/inbox?token=...` 轮询收件、解析 xAI/Grok 验证码。
+
+如需使用付费额度或自定义域名，填写 `templol_api_key`（发送 `Authorization: Bearer`），并在 `templol_domains` 填入域名（逗号分隔）。支持 `*.example.com` 通配，程序会自动生成随机子域名：
+
+```json
+{
+  "email_provider": "templol",
+  "templol_api_key": "你的 TempMail.lol API Key",
+  "templol_domains": "example.com,*.mail.example.com"
+}
+```
 
 ### Cloudflare 临时邮箱匿名模式（默认）
 

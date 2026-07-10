@@ -41,6 +41,8 @@ UI_ACTIVE_BG = "#4a6078"
 
 DEFAULT_CONFIG = {
     "duckmail_api_key": "",
+    "templol_api_key": "",
+    "templol_domains": "",
     "cloudflare_api_base": "",
     "cloudflare_api_key": "",
     "cloudflare_auth_mode": "none",
@@ -919,6 +921,182 @@ def yyds_get_oai_code(
     raise Exception(f"YYDS 在 {timeout}s 内未收到验证码邮件")
 
 
+TEMPLOL_API_BASE = "https://api.tempmail.lol/v2"
+
+
+def get_templol_api_key():
+    return str(config.get("templol_api_key", "") or "").strip()
+
+
+def get_templol_domains():
+    """读取 TempMail.lol 自定义域名，支持列表或逗号分隔字符串。"""
+    raw = config.get("templol_domains", "")
+    if isinstance(raw, (list, tuple)):
+        items = raw
+    else:
+        items = str(raw or "").split(",")
+    return [str(x).strip().lower() for x in items if str(x).strip()]
+
+
+def templol_build_headers(content_type=False):
+    headers = {"Accept": "application/json", "User-Agent": "grok-register/1.0"}
+    if content_type:
+        headers["Content-Type"] = "application/json"
+    key = get_templol_api_key()
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    return headers
+
+
+def templol_generate_subdomain():
+    length = random.randint(4, 10)
+    chars = string.ascii_lowercase + string.digits
+    return "".join(secrets.choice(chars) for _ in range(length))
+
+
+def templol_select_domain():
+    """按配置随机选择域名；`*.example.com` 通配会生成随机子域名。"""
+    domains = get_templol_domains()
+    if not domains:
+        return None, False
+    domain = random.choice(domains)
+    if domain.startswith("*.") and len(domain) > 2:
+        return f"{templol_generate_subdomain()}.{domain[2:]}", True
+    return domain, False
+
+
+def templol_create_mailbox(username=None):
+    payload = {}
+    domain, _force_prefix = templol_select_domain()
+    if domain:
+        payload["domain"] = domain
+    payload["prefix"] = username or generate_username(10)
+    resp = http_post(
+        f"{TEMPLOL_API_BASE}/inbox/create",
+        json=payload,
+        headers=templol_build_headers(content_type=True),
+    )
+    resp.raise_for_status()
+    try:
+        data = resp.json()
+    except Exception:
+        raise Exception(f"TempMail.lol 创建邮箱返回非JSON: {resp.text[:300]}")
+    address = str(data.get("address") or "").strip()
+    token = str(data.get("token") or "").strip()
+    if not address or not token:
+        raise Exception(f"TempMail.lol 创建邮箱缺少 address/token: {data}")
+    return address, token
+
+
+def templol_get_email_and_token():
+    address, token = templol_create_mailbox()
+    print(f"[*] 已创建 TempMail.lol 邮箱: {address}")
+    return address, token
+
+
+def _templol_pick_messages(data):
+    if isinstance(data, list):
+        return [m for m in data if isinstance(m, dict)]
+    if isinstance(data, dict):
+        for key in ("emails", "messages", "data", "items", "list"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return [m for m in value if isinstance(m, dict)]
+    return []
+
+
+def templol_get_messages(token):
+    resp = http_get(
+        f"{TEMPLOL_API_BASE}/inbox",
+        params={"token": token},
+        headers=templol_build_headers(),
+    )
+    resp.raise_for_status()
+    try:
+        data = resp.json()
+    except Exception:
+        raise Exception(f"TempMail.lol inbox 返回非JSON: {resp.text[:300]}")
+    return _templol_pick_messages(data)
+
+
+def _templol_message_id(msg):
+    for key in ("id", "_id", "token", "messageId"):
+        value = msg.get(key)
+        if value:
+            return str(value)
+    return "|".join(str(msg.get(k, "")) for k in ("from", "subject", "date"))
+
+
+def _templol_message_text(msg):
+    parts = []
+    for field in ("text", "body", "content", "text_content", "raw", "intro", "snippet"):
+        value = msg.get(field)
+        if isinstance(value, str) and value.strip():
+            parts.append(value)
+    html_value = msg.get("html")
+    if html_value is None:
+        html_value = msg.get("html_content")
+    if isinstance(html_value, str):
+        html_value = [html_value]
+    if isinstance(html_value, (list, tuple)):
+        for h in html_value:
+            if isinstance(h, str) and h.strip():
+                parts.append(re.sub(r"<[^>]+>", " ", h))
+    return "\n".join(parts)
+
+
+def templol_get_oai_code(
+    token,
+    email,
+    timeout=180,
+    poll_interval=3,
+    log_callback=None,
+    cancel_callback=None,
+    resend_callback=None,
+):
+    deadline = time.time() + timeout
+    # 同一封邮件正文可能延迟可读，允许多次重试解析，避免偶发漏码
+    seen_attempts = {}
+    next_resend_at = time.time() + 35
+    while time.time() < deadline:
+        raise_if_cancelled(cancel_callback)
+        if resend_callback and time.time() >= next_resend_at:
+            try:
+                resend_callback()
+                if log_callback:
+                    log_callback("[*] 已触发重新发送验证码")
+            except Exception as exc:
+                if log_callback:
+                    log_callback(f"[Debug] 触发重发验证码失败: {exc}")
+            next_resend_at = time.time() + 35
+        try:
+            messages = templol_get_messages(token)
+        except Exception as exc:
+            if log_callback:
+                log_callback(f"[Debug] TempMail.lol 拉取邮件列表失败: {exc}")
+            sleep_with_cancel(poll_interval, cancel_callback)
+            continue
+        if log_callback:
+            log_callback(f"[Debug] TempMail.lol 本轮邮件数量: {len(messages)}")
+        for msg in messages:
+            msg_id = _templol_message_id(msg)
+            attempt = int(seen_attempts.get(msg_id, 0))
+            if attempt >= 5:
+                continue
+            seen_attempts[msg_id] = attempt + 1
+            combined = _templol_message_text(msg)
+            subject = str(msg.get("subject", "") or "")
+            if log_callback:
+                log_callback(f"[Debug] TempMail.lol 收到邮件: {subject}")
+            code = extract_verification_code(combined, subject)
+            if code:
+                if log_callback:
+                    log_callback(f"[*] TempMail.lol 从邮件中提取到验证码: {code}")
+                return code
+        sleep_with_cancel(poll_interval, cancel_callback)
+    raise Exception(f"TempMail.lol 在 {timeout}s 内未收到验证码邮件")
+
+
 def generate_username(length=10):
     chars = string.ascii_lowercase + string.digits
     return "".join(secrets.choice(chars) for _ in range(length))
@@ -944,6 +1122,8 @@ def get_email_provider():
 
 def get_email_and_token(api_key=None):
     provider = get_email_provider()
+    if provider == "templol":
+        return templol_get_email_and_token()
     if provider == "yyds":
         return yyds_get_email_and_token(api_key=api_key, jwt=get_yyds_jwt())
     if provider == "cloudflare":
@@ -996,6 +1176,16 @@ def get_oai_code(
     resend_callback=None,
 ):
     provider = get_email_provider()
+    if provider == "templol":
+        return templol_get_oai_code(
+            dev_token,
+            email,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+            resend_callback=resend_callback,
+        )
     if provider == "yyds":
         return yyds_get_oai_code(
             dev_token,
@@ -2598,7 +2788,7 @@ class GrokRegisterGUI:
 
         add_label(0, 0, "邮箱服务商:")
         self.email_provider_var = tk.StringVar(value=config.get("email_provider", "duckmail"))
-        self.email_provider_combo = tk_option_menu(config_frame, self.email_provider_var, ["duckmail", "yyds", "cloudflare"], width=12)
+        self.email_provider_combo = tk_option_menu(config_frame, self.email_provider_var, ["templol", "duckmail", "yyds", "cloudflare"], width=12)
         add_field(self.email_provider_combo, 0, 1, sticky=tk.W)
 
         add_label(0, 2, "注册数量:")
@@ -2697,6 +2887,16 @@ class GrokRegisterGUI:
         self.grok2api_remote_key_entry = tk_entry(config_frame, textvariable=self.grok2api_remote_key_var, width=72)
         add_field(self.grok2api_remote_key_entry, 9, 1, columnspan=3)
 
+        add_label(10, 0, "TempMail.lol Key:")
+        self.templol_api_key_var = tk.StringVar(value=str(config.get("templol_api_key", "")))
+        self.templol_api_key_entry = tk_entry(config_frame, textvariable=self.templol_api_key_var, width=34)
+        add_field(self.templol_api_key_entry, 10, 1)
+
+        add_label(10, 2, "TempMail.lol 域名:")
+        self.templol_domains_var = tk.StringVar(value=str(config.get("templol_domains", "")))
+        self.templol_domains_entry = tk_entry(config_frame, textvariable=self.templol_domains_var, width=34)
+        add_field(self.templol_domains_entry, 10, 3)
+
         btn_frame = tk.Frame(main_frame, bg=UI_BG)
         btn_frame.grid(row=1, column=0, sticky=tk.EW, pady=(0, 6))
         self.start_btn = tk_button(btn_frame, text="开始注册", command=self.start_registration)
@@ -2777,6 +2977,8 @@ class GrokRegisterGUI:
         config["enable_nsfw"] = bool(self.nsfw_var.get())
         config["proxy"] = self.proxy_var.get().strip()
         config["duckmail_api_key"] = self.api_key_var.get().strip()
+        config["templol_api_key"] = self.templol_api_key_var.get().strip()
+        config["templol_domains"] = self.templol_domains_var.get().strip()
         config["cloudflare_api_base"] = self.cloudflare_api_base_var.get().strip()
         config["cloudflare_api_key"] = self.cloudflare_api_key_var.get().strip()
         config["cloudflare_auth_mode"] = self.cloudflare_auth_mode_var.get().strip() or "none"
