@@ -23,6 +23,7 @@ import json
 
 os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
 
+import browser_profile as bp
 from DrissionPage import Chromium, ChromiumOptions
 from DrissionPage.errors import PageDisconnectedError
 from curl_cffi import requests
@@ -31,13 +32,30 @@ from curl_cffi import requests
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 MEMORY_CLEANUP_INTERVAL = 5
 
-UI_BG = "#242424"
-UI_PANEL_BG = "#2b2b2b"
-UI_FG = "#f2f2f2"
-UI_MUTED_FG = "#b8b8b8"
-UI_ENTRY_BG = "#333333"
-UI_BUTTON_BG = "#3a3a3a"
-UI_ACTIVE_BG = "#4a6078"
+# ===== 配色（深色仪表盘 · 青色强调） =====
+UI_BG = "#0e1116"          # 应用底色
+UI_HEADER_BG = "#0b0e12"   # 顶栏
+UI_PANEL_BG = "#161b22"    # 卡片
+UI_PANEL_ALT = "#1c232d"   # 次级卡片 / 输入区
+UI_BORDER = "#2a3441"      # 边框
+UI_FG = "#e6edf3"          # 正文
+UI_MUTED_FG = "#8b95a1"    # 次要文字
+UI_ENTRY_BG = "#1c232d"    # 输入框
+UI_BUTTON_BG = "#222b36"   # 次要按钮
+UI_ACTIVE_BG = "#243447"   # 悬停 / 选中
+UI_ACCENT = "#3fb6c9"      # 强调青
+UI_ACCENT_HOVER = "#57d0e3"
+UI_ACCENT_DIM = "#2b6f7d"
+UI_ON_ACCENT = "#06222a"   # 强调色上的文字
+UI_SUCCESS = "#3fb950"
+UI_WARN = "#d29922"
+UI_ERROR = "#f85149"
+UI_DEBUG = "#6e7681"
+UI_CPA = "#a371f7"
+UI_LOG_BG = "#0a0d11"      # 日志底色
+
+UI_FONT = "Segoe UI"
+UI_MONO_FONT = "Cascadia Code"
 
 DEFAULT_CONFIG = {
     "duckmail_api_key": "",
@@ -51,6 +69,12 @@ DEFAULT_CONFIG = {
     "cloudflare_path_token": "/api/token",
     "cloudflare_path_messages": "/api/mails",
     "proxy": "http://127.0.0.1:7890",
+    "proxy_mode": "single",
+    "proxy_pool": [],
+    "proxy_pool_strategy": "rotate",
+    "anti_fingerprint": True,
+    "max_ip_retry": 3,
+    "concurrency": 1,
     "enable_nsfw": True,
     "register_count": 1,
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
@@ -82,6 +106,68 @@ DEFAULT_CONFIG = {
 
 config = DEFAULT_CONFIG.copy()
 _cf_domain_index = 0
+_proxy_pool = None
+_output_lock = threading.Lock()  # 保护 accounts/token.json/tokens.txt/mail_credentials 并发写入
+
+# 每个 worker 线程各自持有独立的浏览器 / 页面 / 画像（并发注册用）
+_tls = threading.local()
+
+
+def get_browser():
+    return getattr(_tls, "browser", None)
+
+
+def set_browser(value):
+    _tls.browser = value
+
+
+def get_page():
+    return getattr(_tls, "page", None)
+
+
+def set_page(value):
+    _tls.page = value
+
+
+def get_profile():
+    return getattr(_tls, "profile", None)
+
+
+def set_profile(value):
+    _tls.profile = value
+
+
+def worker_tag():
+    return getattr(_tls, "tag", "")
+
+
+# 所有存活浏览器的登记表，供「停止」时强制关闭以打断阻塞中的浏览器操作
+_live_browsers = set()
+_live_lock = threading.Lock()
+
+
+def _register_browser(b):
+    if b is not None:
+        with _live_lock:
+            _live_browsers.add(b)
+
+
+def _unregister_browser(b):
+    if b is not None:
+        with _live_lock:
+            _live_browsers.discard(b)
+
+
+def force_stop_all_browsers():
+    """强制关闭所有存活浏览器，让卡在导航/等待里的 worker 立刻报错退出。"""
+    with _live_lock:
+        browsers = list(_live_browsers)
+        _live_browsers.clear()
+    for b in browsers:
+        try:
+            b.quit(del_data=True)
+        except Exception:
+            pass
 
 
 class RegistrationCancelled(Exception):
@@ -89,6 +175,11 @@ class RegistrationCancelled(Exception):
 
 
 class AccountRetryNeeded(Exception):
+    pass
+
+
+class ProxySwitchNeeded(Exception):
+    """当前 IP 打不开网页或过不了 Cloudflare，需要切换到下一个代理重试。"""
     pass
 
 
@@ -158,7 +249,12 @@ DUCKMAIL_API_BASE = "https://api.duckmail.sbs"
 
 
 def get_proxies():
-    proxy = config.get("proxy", "")
+    proxy = ""
+    _profile = get_profile()
+    if _profile:
+        proxy = str(_profile.get("proxy", "") or "").strip()
+    if not proxy:
+        proxy = str(config.get("proxy", "") or "").strip()
     if proxy:
         return {"http": proxy, "https": proxy}
     return {}
@@ -449,18 +545,19 @@ def add_token_to_grok2api_remote_pool(raw_token, email="", log_callback=None):
 
 
 def add_token_to_grok2api_pools(raw_token, email="", log_callback=None):
-    if config.get("grok2api_auto_add_local", True):
-        try:
-            add_token_to_grok2api_local_pool(raw_token, email=email, log_callback=log_callback)
-        except Exception as exc:
-            if log_callback:
-                log_callback(f"[Debug] 写入 grok2api 本地池失败: {exc}")
-    if config.get("grok2api_auto_add_remote", False):
-        try:
-            add_token_to_grok2api_remote_pool(raw_token, email=email, log_callback=log_callback)
-        except Exception as exc:
-            if log_callback:
-                log_callback(f"[Debug] 写入 grok2api 远端池失败: {exc}")
+    with _output_lock:
+        if config.get("grok2api_auto_add_local", True):
+            try:
+                add_token_to_grok2api_local_pool(raw_token, email=email, log_callback=log_callback)
+            except Exception as exc:
+                if log_callback:
+                    log_callback(f"[Debug] 写入 grok2api 本地池失败: {exc}")
+        if config.get("grok2api_auto_add_remote", False):
+            try:
+                add_token_to_grok2api_remote_pool(raw_token, email=email, log_callback=log_callback)
+            except Exception as exc:
+                if log_callback:
+                    log_callback(f"[Debug] 写入 grok2api 远端池失败: {exc}")
 
 
 def add_token_to_token_only_file(raw_token, log_callback=None):
@@ -471,8 +568,9 @@ def add_token_to_token_only_file(raw_token, log_callback=None):
     if not token_only_file:
         token_only_file = os.path.join(os.path.dirname(__file__), "tokens.txt")
     try:
-        with open(token_only_file, "a", encoding="utf-8") as f:
-            f.write(f"{token}\n")
+        with _output_lock:
+            with open(token_only_file, "a", encoding="utf-8") as f:
+                f.write(f"{token}\n")
         if log_callback:
             log_callback(f"[+] 已写入 token 文件: {token_only_file}")
         return True
@@ -533,12 +631,39 @@ def export_cpa_xai_for_account(email, password, sso=None, log_callback=None, pag
         return {"ok": False, "error": str(exc)}
 
 
+def anti_fingerprint_enabled():
+    return bool(config.get("anti_fingerprint", True))
+
+
 def create_browser_options():
     options = ChromiumOptions()
     options.auto_port()
     options.set_timeouts(base=1)
     if os.path.exists(EXTENSION_PATH):
         options.add_extension(EXTENSION_PATH)
+
+    profile = get_profile()
+    proxy = ""
+    if profile:
+        proxy = str(profile.get("proxy", "") or "").strip()
+    else:
+        proxy = str(config.get("proxy", "") or "").strip()
+
+    if anti_fingerprint_enabled() and profile:
+        # 只随机安全维度：视口与语言。刻意不改 UA / 平台，保持与真实浏览器、
+        # client hints、TLS 一致，避免触发 Cloudflare Turnstile。
+        vw, vh = profile.get("viewport", [1920, 1080])
+        options.set_argument(f"--window-size={vw},{vh}")
+        options.set_argument(f"--lang={profile.get('lang', 'en-US')}")
+        options.set_argument("--disable-blink-features=AutomationControlled")
+
+    if proxy:
+        server = bp.proxy_server_arg(proxy)
+        if server:
+            options.set_argument(f"--proxy-server={server}")
+        # 带认证代理的用户名/密码通过 CDP Fetch 在页面上处理（见 ensure_proxy_auth），
+        # 不再用扩展 service worker（新版 Chrome 上不可靠）。
+
     return options
 
 
@@ -580,7 +705,7 @@ def http_post(url, **kwargs):
 
 def raise_if_cancelled(cancel_callback=None):
     if cancel_callback and cancel_callback():
-        raise RegistrationCancelled("鐢ㄦ埛鍋滄娉ㄥ唽")
+        raise RegistrationCancelled("用户停止注册")
 
 
 def sleep_with_cancel(seconds, cancel_callback=None):
@@ -769,7 +894,7 @@ def yyds_create_account(address=None, domain=None, api_key=None, jwt=None):
     data = resp.json()
     if data.get("success"):
         return data.get("data", {})
-    raise Exception(f"YYDS 鍒涘缓閭澶辫触: {data}")
+    raise Exception(f"YYDS 创建邮箱失败: {data}")
 
 
 def yyds_get_token(address, api_key=None, jwt=None):
@@ -787,7 +912,7 @@ def yyds_get_token(address, api_key=None, jwt=None):
     data = resp.json()
     if data.get("success"):
         return data.get("data", {}).get("token")
-    raise Exception(f"YYDS 鑾峰彇token澶辫触: {data}")
+    raise Exception(f"YYDS 获取 token 失败: {data}")
 
 
 def yyds_get_messages(address, token=None, api_key=None, jwt=None):
@@ -823,7 +948,7 @@ def yyds_get_message_detail(message_id, token=None, api_key=None, jwt=None):
     data = resp.json()
     if data.get("success"):
         return data.get("data", {})
-    raise Exception(f"YYDS 鑾峰彇閭欢璇︽儏澶辫触: {data}")
+    raise Exception(f"YYDS 获取邮件详情失败: {data}")
 
 
 def yyds_generate_username(length=10):
@@ -834,7 +959,7 @@ def yyds_generate_username(length=10):
 def yyds_pick_domain(api_key=None, jwt=None):
     domains = yyds_get_domains(api_key=api_key, jwt=jwt)
     if not domains:
-        raise Exception("YYDS 娌℃湁杩斿洖浠讳綍鍙敤鍩熷悕")
+        raise Exception("YYDS 没有返回任何可用域名")
     private = [d for d in domains if d.get("isVerified") and not d.get("isPublic")]
     if private:
         return private[0]["domain"]
@@ -844,7 +969,7 @@ def yyds_pick_domain(api_key=None, jwt=None):
     verified = [d for d in domains if d.get("isVerified")]
     if verified:
         return verified[0]["domain"]
-    raise Exception("YYDS 鏃犲凡楠岃瘉鍩熷悕鍙敤")
+    raise Exception("YYDS 无已验证域名可用")
 
 
 def yyds_get_email_and_token(api_key=None, jwt=None):
@@ -862,8 +987,8 @@ def yyds_get_email_and_token(api_key=None, jwt=None):
     if not temp_token:
         temp_token = yyds_get_token(address, api_key=key, jwt=token)
     if not temp_token:
-        raise Exception("鑾峰彇 YYDS token 澶辫触")
-    print(f"[*] 宸插垱寤?YYDS 閭: {address}")
+        raise Exception("获取 YYDS token 失败")
+    print(f"[*] 已创建 YYDS 邮箱: {address}")
     return address, temp_token
 
 
@@ -884,7 +1009,7 @@ def yyds_get_oai_code(
             messages = yyds_get_messages(address, token=token, jwt=jwt)
         except Exception as exc:
             if log_callback:
-                log_callback(f"[Debug] YYDS 鎷夊彇閭欢鍒楄〃澶辫触: {exc}")
+                log_callback(f"[Debug] YYDS 拉取邮件列表失败: {exc}")
             sleep_with_cancel(poll_interval, cancel_callback)
             continue
         for msg in messages:
@@ -899,7 +1024,7 @@ def yyds_get_oai_code(
                 detail = yyds_get_message_detail(msg_id, token=token, jwt=jwt)
             except Exception as exc:
                 if log_callback:
-                    log_callback(f"[Debug] YYDS 鑾峰彇閭欢璇︽儏澶辫触: {exc}")
+                    log_callback(f"[Debug] YYDS 获取邮件详情失败: {exc}")
                 continue
             parts = []
             text_body = detail.get("text") or ""
@@ -911,11 +1036,11 @@ def yyds_get_oai_code(
             combined = "\n".join(parts)
             subject = detail.get("subject", "")
             if log_callback:
-                log_callback(f"[Debug] YYDS 鏀跺埌閭欢: {subject}")
+                log_callback(f"[Debug] YYDS 收到邮件: {subject}")
             code = extract_verification_code(combined, subject)
             if code:
                 if log_callback:
-                    log_callback(f"[*] YYDS 浠庨偖浠朵腑鎻愬彇鍒伴獙璇佺爜: {code}")
+                    log_callback(f"[*] YYDS 从邮件中提取到验证码: {code}")
                 return code
         sleep_with_cancel(poll_interval, cancel_callback)
     raise Exception(f"YYDS 在 {timeout}s 内未收到验证码邮件")
@@ -1105,7 +1230,7 @@ def generate_username(length=10):
 def pick_domain(api_key=None):
     domains = get_domains(api_key=api_key)
     if not domains:
-        raise Exception("DuckMail 娌℃湁杩斿洖浠讳綍鍙敤鍩熷悕")
+        raise Exception("DuckMail 没有返回任何可用域名")
     private = [d for d in domains if d.get("ownerId")]
     verified_private = [d for d in private if d.get("isVerified")]
     if verified_private:
@@ -1113,7 +1238,7 @@ def pick_domain(api_key=None):
     public = [d for d in domains if d.get("isVerified")]
     if public:
         return public[0]["domain"]
-    raise Exception("DuckMail 鏃犲凡楠岃瘉鍩熷悕鍙敤")
+    raise Exception("DuckMail 无已验证域名可用")
 
 
 def get_email_provider():
@@ -1162,7 +1287,7 @@ def get_email_and_token(api_key=None):
     create_account(address, password, api_key=key, expires_in=0)
     token = get_token(address, password)
     if not token:
-        raise Exception("鑾峰彇 DuckMail token 澶辫触")
+        raise Exception("获取 DuckMail token 失败")
     return address, token
 
 
@@ -1252,7 +1377,7 @@ def duckmail_get_oai_code(
             messages = get_messages(dev_token)
         except Exception as exc:
             if log_callback:
-                log_callback(f"[Debug] 鎷夊彇閭欢鍒楄〃澶辫触: {exc}")
+                log_callback(f"[Debug] 拉取邮件列表失败: {exc}")
             sleep_with_cancel(poll_interval, cancel_callback)
             continue
         for msg in messages:
@@ -1267,7 +1392,7 @@ def duckmail_get_oai_code(
                 detail = get_message_detail(dev_token, msg_id)
             except Exception as exc:
                 if log_callback:
-                    log_callback(f"[Debug] 鑾峰彇閭欢璇︽儏澶辫触: {exc}")
+                    log_callback(f"[Debug] 获取邮件详情失败: {exc}")
                 continue
             parts = []
             text_body = detail.get("text") or ""
@@ -1279,11 +1404,11 @@ def duckmail_get_oai_code(
             combined = "\n".join(parts)
             subject = detail.get("subject", "")
             if log_callback:
-                log_callback(f"[Debug] 鏀跺埌閭欢: {subject}")
+                log_callback(f"[Debug] 收到邮件: {subject}")
             code = extract_verification_code(combined, subject)
             if code:
                 if log_callback:
-                    log_callback(f"[*] 浠庨偖浠朵腑鎻愬彇鍒伴獙璇佺爜: {code}")
+                    log_callback(f"[*] 从邮件中提取到验证码: {code}")
                 return code
         sleep_with_cancel(poll_interval, cancel_callback)
     raise Exception(f"在 {timeout}s 内未收到验证码邮件")
@@ -1401,10 +1526,27 @@ def generate_random_birthdate():
 
 def response_preview(res, limit=200):
     try:
-        text = str(res.text or "")
+        raw = str(res.text or "")
     except Exception:
-        text = ""
-    text = re.sub(r"\s+", " ", text).strip()
+        raw = ""
+    if raw:
+        # gRPC/protobuf 等二进制响应体当文本会渲染成乱码方块，检测后改为摘要
+        bad = sum(
+            1
+            for ch in raw
+            if (ord(ch) < 0x20 and ch not in "\r\n\t")
+            or ord(ch) == 0x7f
+            or 0x80 <= ord(ch) < 0xA0
+            or ord(ch) == 0xFFFD
+        )
+        if bad / len(raw) > 0.08:
+            try:
+                n = len(res.content)
+            except Exception:
+                n = len(raw)
+            return f"<binary {n} bytes>"
+    text = re.sub(r"\s+", " ", raw).strip()
+    text = "".join(ch for ch in text if ch.isprintable())
     return text[:limit]
 
 
@@ -1557,44 +1699,91 @@ def enable_nsfw_for_token(token, cf_clearance="", log_callback=None):
 
 SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
 
-browser = None
-page = None
-
 
 def setup_light_theme(root):
     try:
         root.option_add("*Background", UI_BG)
         root.option_add("*Foreground", UI_FG)
-        root.option_add("*selectBackground", UI_ACTIVE_BG)
+        root.option_add("*selectBackground", UI_ACCENT_DIM)
         root.option_add("*selectForeground", UI_FG)
-        root.option_add("*insertBackground", UI_FG)
-        root.option_add("*Entry.Background", UI_ENTRY_BG)
-        root.option_add("*Text.Background", UI_ENTRY_BG)
-        root.option_add("*Menu.Background", UI_ENTRY_BG)
+        root.option_add("*insertBackground", UI_ACCENT)
+        root.option_add("*Menu.Background", UI_PANEL_ALT)
         root.option_add("*Menu.Foreground", UI_FG)
+        root.option_add("*Menu.activeBackground", UI_ACCENT_DIM)
+        root.option_add("*Menu.activeForeground", UI_FG)
+        root.configure(bg=UI_BG)
+
         style = ttk.Style(root)
         available = set(style.theme_names())
         if "clam" in available:
             style.theme_use("clam")
         elif "default" in available:
             style.theme_use("default")
-        root.configure(bg=UI_BG)
-        style.configure(".", background=UI_BG, foreground=UI_FG, fieldbackground=UI_ENTRY_BG)
+
+        style.configure(".", background=UI_BG, foreground=UI_FG,
+                        fieldbackground=UI_ENTRY_BG, bordercolor=UI_BORDER,
+                        focuscolor=UI_ACCENT)
         style.configure("TFrame", background=UI_BG)
-        style.configure("TLabelframe", background=UI_BG, foreground=UI_FG)
-        style.configure("TLabelframe.Label", background=UI_BG, foreground=UI_FG)
-        style.configure("TLabel", background=UI_BG, foreground=UI_FG)
-        style.configure("TCheckbutton", background=UI_BG, foreground=UI_FG)
-        style.configure("TButton", background=UI_BUTTON_BG, foreground=UI_FG)
-        style.configure("TEntry", fieldbackground=UI_ENTRY_BG, foreground=UI_FG)
-        style.configure("TCombobox", fieldbackground=UI_ENTRY_BG, foreground=UI_FG)
-        style.configure("TSpinbox", fieldbackground=UI_ENTRY_BG, foreground=UI_FG)
+        style.configure("Card.TFrame", background=UI_PANEL_BG)
+        style.configure("TLabel", background=UI_BG, foreground=UI_FG, font=(UI_FONT, 10))
+
+        # 配置区 Tab
+        style.configure("TNotebook", background=UI_PANEL_BG, borderwidth=0,
+                        tabmargins=(4, 6, 4, 0))
+        style.configure("TNotebook.Tab", background=UI_PANEL_BG, foreground=UI_MUTED_FG,
+                        padding=(18, 9), font=(UI_FONT, 10), borderwidth=0)
+        style.map(
+            "TNotebook.Tab",
+            background=[("selected", UI_PANEL_ALT)],
+            foreground=[("selected", UI_ACCENT), ("active", UI_FG)],
+        )
+
+        # 进度条
+        style.configure("Accent.Horizontal.TProgressbar", troughcolor=UI_PANEL_ALT,
+                        background=UI_ACCENT, borderwidth=0, thickness=8)
+
+        # 滚动条
+        style.configure("Vertical.TScrollbar", background=UI_PANEL_ALT, troughcolor=UI_LOG_BG,
+                        bordercolor=UI_LOG_BG, arrowcolor=UI_MUTED_FG, borderwidth=0)
+        style.map("Vertical.TScrollbar", background=[("active", UI_ACCENT_DIM)])
+
+        # 下拉框（只读 Combobox）
+        style.configure(
+            "Dark.TCombobox",
+            fieldbackground=UI_ENTRY_BG,
+            background=UI_ENTRY_BG,
+            foreground=UI_FG,
+            arrowcolor=UI_MUTED_FG,
+            bordercolor=UI_BORDER,
+            lightcolor=UI_BORDER,
+            darkcolor=UI_BORDER,
+            relief="flat",
+            padding=6,
+        )
+        style.map(
+            "Dark.TCombobox",
+            fieldbackground=[("readonly", UI_ENTRY_BG), ("disabled", UI_PANEL_BG)],
+            foreground=[("readonly", UI_FG), ("disabled", UI_MUTED_FG)],
+            arrowcolor=[("disabled", UI_DEBUG), ("active", UI_ACCENT)],
+            bordercolor=[("focus", UI_ACCENT), ("hover", UI_ACCENT_DIM)],
+            selectbackground=[("readonly", UI_ENTRY_BG)],
+            selectforeground=[("readonly", UI_FG)],
+        )
+        # 弹出列表
+        root.option_add("*TCombobox*Listbox.background", UI_PANEL_ALT)
+        root.option_add("*TCombobox*Listbox.foreground", UI_FG)
+        root.option_add("*TCombobox*Listbox.selectBackground", UI_ACCENT_DIM)
+        root.option_add("*TCombobox*Listbox.selectForeground", UI_FG)
+        root.option_add("*TCombobox*Listbox.font", (UI_FONT, 10))
+        root.option_add("*TCombobox*Listbox.borderWidth", 0)
+        root.option_add("*TCombobox*Listbox.relief", "flat")
     except Exception:
         pass
 
 
-def tk_label(parent, text="", **kwargs):
-    return tk.Label(parent, text=text, bg=kwargs.pop("bg", UI_BG), fg=kwargs.pop("fg", UI_FG), **kwargs)
+def tk_label(parent, text="", bg=UI_PANEL_BG, fg=UI_FG, **kwargs):
+    kwargs.setdefault("font", (UI_FONT, 10))
+    return tk.Label(parent, text=text, bg=bg, fg=fg, **kwargs)
 
 
 def tk_entry(parent, textvariable=None, width=30, **kwargs):
@@ -1604,44 +1793,33 @@ def tk_entry(parent, textvariable=None, width=30, **kwargs):
         width=width,
         bg=UI_ENTRY_BG,
         fg=UI_FG,
-        insertbackground=UI_FG,
-        disabledbackground="#2f2f2f",
+        insertbackground=UI_ACCENT,
+        disabledbackground=UI_PANEL_BG,
         disabledforeground=UI_MUTED_FG,
         highlightthickness=1,
-        highlightbackground="#555555",
-        relief=tk.SOLID,
+        highlightbackground=UI_BORDER,
+        highlightcolor=UI_ACCENT,
+        relief=tk.FLAT,
+        font=(UI_FONT, 10),
         **kwargs,
     )
 
 
-def tk_button(parent, text="", command=None, state=tk.NORMAL, **kwargs):
-    return tk.Button(
-        parent,
-        text=text,
-        command=command,
-        state=state,
-        bg=UI_BUTTON_BG,
-        fg=UI_FG,
-        activebackground=UI_ACTIVE_BG,
-        activeforeground=UI_FG,
-        disabledforeground="#777777",
-        relief=tk.RAISED,
-        padx=10,
-        pady=3,
-        **kwargs,
-    )
-
-
-def tk_checkbutton(parent, text="", variable=None, **kwargs):
+def tk_checkbutton(parent, text="", variable=None, bg=UI_PANEL_BG, **kwargs):
     return tk.Checkbutton(
         parent,
         text=text,
         variable=variable,
-        bg=UI_BG,
+        bg=bg,
         fg=UI_FG,
-        activebackground=UI_BG,
-        activeforeground=UI_FG,
-        selectcolor="#3d7be0",
+        activebackground=bg,
+        activeforeground=UI_ACCENT,
+        selectcolor=UI_PANEL_ALT,
+        font=(UI_FONT, 10),
+        highlightthickness=0,
+        bd=0,
+        anchor="w",
+        cursor="hand2",
         **kwargs,
     )
 
@@ -1652,24 +1830,307 @@ def tk_option_menu(parent, variable, values, width=12):
         width=width,
         bg=UI_ENTRY_BG,
         fg=UI_FG,
-        activebackground=UI_ACTIVE_BG,
+        activebackground=UI_ACCENT_DIM,
         activeforeground=UI_FG,
         highlightthickness=1,
-        highlightbackground="#555555",
-        relief=tk.SOLID,
+        highlightbackground=UI_BORDER,
+        relief=tk.FLAT,
+        font=(UI_FONT, 10),
+        anchor="w",
+        cursor="hand2",
     )
-    menu["menu"].configure(bg=UI_ENTRY_BG, fg=UI_FG, activebackground=UI_ACTIVE_BG, activeforeground=UI_FG)
+    menu["menu"].configure(
+        bg=UI_PANEL_ALT,
+        fg=UI_FG,
+        activebackground=UI_ACCENT_DIM,
+        activeforeground=UI_FG,
+        bd=0,
+    )
     return menu
 
 
+def tk_combo(parent, variable, values, width=14):
+    """只读下拉框，深色扁平样式（替代原生 OptionMenu）。"""
+    cb = ttk.Combobox(
+        parent,
+        textvariable=variable,
+        values=list(values),
+        state="readonly",
+        width=width,
+        style="Dark.TCombobox",
+        font=(UI_FONT, 10),
+    )
+    return cb
+
+
+def tk_text(parent, height=4, width=30):
+    """多行文本输入框，深色扁平样式（用于代理池等多行内容）。"""
+    return tk.Text(
+        parent,
+        height=height,
+        width=width,
+        bg=UI_ENTRY_BG,
+        fg=UI_FG,
+        insertbackground=UI_ACCENT,
+        highlightthickness=1,
+        highlightbackground=UI_BORDER,
+        highlightcolor=UI_ACCENT,
+        relief=tk.FLAT,
+        bd=0,
+        wrap="none",
+        padx=8,
+        pady=6,
+        font=(UI_MONO_FONT, 10),
+    )
+
+
+
+def make_button(parent, text="", command=None, primary=False, state=tk.NORMAL, width=None):
+    """扁平化按钮 + 悬停高亮。primary=True 为青色主按钮。"""
+    base = UI_ACCENT if primary else UI_BUTTON_BG
+    fg = UI_ON_ACCENT if primary else UI_FG
+    hover = UI_ACCENT_HOVER if primary else UI_ACTIVE_BG
+    btn = tk.Button(
+        parent,
+        text=text,
+        command=command,
+        state=state,
+        bg=base,
+        fg=fg,
+        activebackground=hover,
+        activeforeground=fg,
+        disabledforeground=UI_MUTED_FG,
+        relief=tk.FLAT,
+        bd=0,
+        padx=16,
+        pady=9,
+        cursor="hand2",
+        font=(UI_FONT, 10, "bold") if primary else (UI_FONT, 10),
+    )
+    if width:
+        btn.configure(width=width)
+    btn._base_bg = base
+    btn._hover_bg = hover
+
+    def on_enter(_):
+        if str(btn["state"]) != "disabled":
+            btn.configure(bg=hover)
+
+    def on_leave(_):
+        if str(btn["state"]) != "disabled":
+            btn.configure(bg=base)
+
+    btn.bind("<Enter>", on_enter)
+    btn.bind("<Leave>", on_leave)
+    return btn
+
+
+def tk_button(parent, text="", command=None, state=tk.NORMAL, **kwargs):
+    # 兼容旧调用；委托到扁平按钮
+    return make_button(parent, text=text, command=command, state=state)
+
+
+def tk_spinbox(parent, textvariable=None, from_=1, to=100, width=8):
+    return tk.Spinbox(
+        parent,
+        from_=from_,
+        to=to,
+        width=width,
+        textvariable=textvariable,
+        bg=UI_ENTRY_BG,
+        fg=UI_FG,
+        insertbackground=UI_ACCENT,
+        buttonbackground=UI_BUTTON_BG,
+        disabledbackground=UI_PANEL_BG,
+        disabledforeground=UI_MUTED_FG,
+        highlightthickness=1,
+        highlightbackground=UI_BORDER,
+        highlightcolor=UI_ACCENT,
+        relief=tk.FLAT,
+        font=(UI_FONT, 10),
+    )
+
+
+def _blend_hex(c1, c2, t):
+    """在两个 #rrggbb 之间线性插值，t∈[0,1]。"""
+    a = c1.lstrip("#")
+    b = c2.lstrip("#")
+    r1, g1, b1 = int(a[0:2], 16), int(a[2:4], 16), int(a[4:6], 16)
+    r2, g2, b2 = int(b[0:2], 16), int(b[2:4], 16), int(b[4:6], 16)
+    r = round(r1 + (r2 - r1) * t)
+    g = round(g1 + (g2 - g1) * t)
+    bl = round(b1 + (b2 - b1) * t)
+    return f"#{r:02x}{g:02x}{bl:02x}"
+
+
+def _sanitize_log_text(s):
+    """去除控制/不可打印字符，避免二进制内容在日志里显示成乱码方块。"""
+    out = []
+    for ch in str(s):
+        if ch == "\t":
+            out.append("    ")
+        elif ord(ch) < 0x20 or ord(ch) == 0x7f or ord(ch) == 0xfffd:
+            continue
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+
+
+def init_proxy_pool(log_callback=None):
+    """根据 config 初始化全局代理池。"""
+    global _proxy_pool
+    _proxy_pool = bp.ProxyPool(
+        mode=config.get("proxy_mode", "single"),
+        single=config.get("proxy", ""),
+        pool=config.get("proxy_pool", []),
+        strategy=config.get("proxy_pool_strategy", "rotate"),
+    )
+    if log_callback:
+        if _proxy_pool.mode == "pool":
+            log_callback(f"[*] 代理模式: 代理池({_proxy_pool.size()} 个) 策略={_proxy_pool.strategy}")
+        else:
+            label = bp.proxy_log_label(_proxy_pool.single) if _proxy_pool.single else "(直连)"
+            log_callback(f"[*] 代理模式: 单一代理 {label}")
+    return _proxy_pool
+
+
+def start_new_account_profile(log_callback=None, cancel=None):
+    """每个账号开始时调用：领取代理 + 生成新指纹画像，存到线程本地画像。"""
+    global _proxy_pool
+    if _proxy_pool is None:
+        init_proxy_pool(log_callback=log_callback)
+    # 释放上一个账号的临时扩展与占用的代理
+    prev = get_profile()
+    if prev is not None:
+        bp.cleanup_profile(prev)
+        if _proxy_pool:
+            _proxy_pool.release(prev.get("proxy"))
+    proxy = _proxy_pool.acquire(cancel=cancel) if _proxy_pool else config.get("proxy", "")
+    profile = bp.build_account_profile(proxy=proxy)
+    set_profile(profile)
+    if log_callback:
+        if anti_fingerprint_enabled():
+            log_callback(f"[*] 本账号浏览器画像: {bp.profile_summary(profile)}")
+        else:
+            log_callback(f"[*] 本账号出口 IP: {bp.proxy_log_label(profile.get('proxy'))} (指纹随机化已关闭)")
+    return profile
+
+
+def switch_to_next_ip(log_callback=None, cancel=None):
+    """标记当前 IP 失效并换到下一个，重建画像（沿用指纹随机化设置）。"""
+    global _proxy_pool
+    if _proxy_pool is None:
+        init_proxy_pool(log_callback=log_callback)
+    prev = get_profile()
+    old_proxy = prev.get("proxy") if prev else None
+    if prev is not None:
+        bp.cleanup_profile(prev)
+    if old_proxy and _proxy_pool:
+        _proxy_pool.mark_bad(old_proxy)  # 内部会移出占用集合
+    proxy = _proxy_pool.acquire(cancel=cancel) if _proxy_pool else None
+    profile = bp.build_account_profile(proxy=proxy)
+    set_profile(profile)
+    if log_callback:
+        log_callback(f"[*] 已切换出口 IP: {bp.proxy_log_label(old_proxy)} -> {bp.proxy_log_label(proxy)}")
+    return profile
+
+
+def release_current_proxy():
+    """worker 结束时释放它占用的代理。"""
+    prof = get_profile()
+    if prof is not None and _proxy_pool:
+        _proxy_pool.release(prof.get("proxy"))
+
+
+def ensure_proxy_auth(target_page, log_callback=None):
+    """用 CDP Fetch 处理带认证代理的用户名/密码（比扩展 SW 更可靠，且新版 Chrome MV2 已失效）。
+
+    在每个标签页上启用 Fetch.enable(handleAuthRequests)，收到 authRequired 时
+    用 continueWithAuth 提供凭据，其余请求直接 continueRequest 放行。
+    """
+    if target_page is None:
+        return
+    profile = get_profile()
+    proxy = str((profile or {}).get("proxy", "") or "").strip()
+    if not proxy:
+        proxy = str(config.get("proxy", "") or "").strip()
+    info = bp.parse_proxy(proxy)
+    if not info or not info.get("username"):
+        return  # 无认证代理无需处理
+    if getattr(target_page, "_proxy_auth_applied", False):
+        return
+    user = info["username"]
+    pw = info["password"]
+    try:
+        driver = target_page.driver
+
+        def _on_auth(**kw):
+            try:
+                driver.run(
+                    "Fetch.continueWithAuth",
+                    requestId=kw.get("requestId"),
+                    authChallengeResponse={
+                        "response": "ProvideCredentials",
+                        "username": user,
+                        "password": pw,
+                    },
+                )
+            except Exception:
+                pass
+
+        def _on_paused(**kw):
+            try:
+                driver.run("Fetch.continueRequest", requestId=kw.get("requestId"))
+            except Exception:
+                pass
+
+        driver.set_callback("Fetch.authRequired", _on_auth)
+        driver.set_callback("Fetch.requestPaused", _on_paused)
+        target_page.run_cdp("Fetch.enable", handleAuthRequests=True, patterns=[{"urlPattern": "*"}])
+        try:
+            target_page._proxy_auth_applied = True
+        except Exception:
+            pass
+        if log_callback:
+            log_callback(f"[Debug] 已启用代理认证(CDP): {bp.proxy_log_label(proxy)}")
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] 启用代理认证失败: {exc}")
+
+
+def ensure_stealth(target_page, log_callback=None):
+    """对指定标签页幂等注入 stealth 脚本（每个新文档加载前执行），并处理代理认证。"""
+    ensure_proxy_auth(target_page, log_callback=log_callback)
+    _profile = get_profile()
+    if not anti_fingerprint_enabled() or not _profile or target_page is None:
+        return
+    if getattr(target_page, "_stealth_applied", False):
+        return
+    try:
+        script = bp.build_stealth_script(_profile)
+        target_page.run_cdp("Page.addScriptToEvaluateOnNewDocument", source=script)
+        try:
+            target_page._stealth_applied = True
+        except Exception:
+            pass
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] 注入 stealth 脚本失败: {exc}")
+
+
 def start_browser(log_callback=None):
-    global browser, page
     last_exc = None
     for attempt in range(1, 5):
         try:
             browser = Chromium(create_browser_options())
+            set_browser(browser)
+            _register_browser(browser)
             tabs = browser.get_tabs()
             page = tabs[-1] if tabs else browser.new_tab()
+            set_page(page)
+            ensure_stealth(page, log_callback=log_callback)
             if log_callback and getattr(browser, "user_data_path", None):
                 log_callback(f"[Debug] 当前浏览器资料目录: {browser.user_data_path}")
             if log_callback and attempt > 1:
@@ -1680,25 +2141,28 @@ def start_browser(log_callback=None):
             if log_callback:
                 log_callback(f"[Debug] 浏览器启动失败(第{attempt}/4次): {exc}")
             try:
-                if browser is not None:
-                    browser.quit(del_data=True)
+                _b = get_browser()
+                if _b is not None:
+                    _unregister_browser(_b)
+                    _b.quit(del_data=True)
             except Exception:
                 pass
-            browser = None
-            page = None
+            set_browser(None)
+            set_page(None)
             time.sleep(min(1.5 * attempt, 4))
     raise Exception(f"浏览器启动失败，已重试4次: {last_exc}")
 
 
 def stop_browser():
-    global browser, page
+    browser = get_browser()
     if browser is not None:
+        _unregister_browser(browser)
         try:
             browser.quit(del_data=True)
         except Exception:
             pass
-    browser = None
-    page = None
+    set_browser(None)
+    set_page(None)
 
 
 def restart_browser(log_callback=None):
@@ -1716,22 +2180,25 @@ def cleanup_runtime_memory(log_callback=None, reason="定期清理"):
 
 
 def refresh_active_page():
-    global browser, page
+    browser = get_browser()
     if browser is None:
         restart_browser()
+        browser = get_browser()
     try:
         tabs = browser.get_tabs()
         if tabs:
             page = tabs[-1]
         else:
             page = browser.new_tab()
+        set_page(page)
+        ensure_stealth(page)
     except Exception:
         restart_browser()
-    return page
+    return get_page()
 
 
 def click_email_signup_button(timeout=10, log_callback=None, cancel_callback=None):
-    global page
+    page = get_page()
     deadline = time.time() + timeout
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
@@ -1798,30 +2265,107 @@ return candidates[0].text || true;
     raise Exception("未找到「使用邮箱注册」按钮")
 
 
+CF_BLOCK_MARKERS = (
+    "just a moment",
+    "verifying you are human",
+    "verify you are human",
+    "attention required",
+    "checking your browser",
+    "cf-browser-verification",
+    "cf-challenge",
+    "请稍候",
+    "正在验证",
+    "稍等",
+)
+
+
+def _page_probe(target_page):
+    try:
+        url = str(target_page.url or "")
+    except Exception:
+        url = ""
+    title = ""
+    body = ""
+    try:
+        title = str(target_page.title or "")
+    except Exception:
+        pass
+    try:
+        body = target_page.run_js(
+            "return (document.body ? document.body.innerText : '').slice(0, 2000);"
+        ) or ""
+    except Exception:
+        body = ""
+    return url, title, str(body)
+
+
+def check_page_blocked(target_page, settle_seconds=8, cancel_callback=None, log_callback=None):
+    """返回 'ok' | 'blocked' | 'unreachable'。短暂等待让 Cloudflare 挑战自解。"""
+    deadline = time.time() + max(1, settle_seconds)
+    last = "ok"
+    url = title = ""
+    while time.time() < deadline:
+        raise_if_cancelled(cancel_callback)
+        url, title, body = _page_probe(target_page)
+        low = (title + "\n" + body).lower()
+        if url.startswith("chrome-error") or url in ("", "about:blank"):
+            last = "unreachable"
+        elif any(m in low for m in CF_BLOCK_MARKERS):
+            last = "blocked"
+        else:
+            return "ok"
+        sleep_with_cancel(1.0, cancel_callback)
+    if log_callback and last != "ok":
+        log_callback(f"[Debug] 页面状态检测: {last} url={url} title={title[:60]}")
+    return last
+
+
+def _can_switch_ip():
+    return _proxy_pool is not None and _proxy_pool.mode == "pool" and _proxy_pool.has_alternative()
+
+
 def open_signup_page(log_callback=None, cancel_callback=None):
-    global browser, page
     raise_if_cancelled(cancel_callback)
-    if browser is None:
+    if get_browser() is None:
         start_browser()
         if log_callback:
             log_callback("[*] 浏览器已启动")
+    browser = get_browser()
     try:
         page = browser.get_tab(0)
+        # 导航前先确保代理认证(CDP Fetch)已在该标签页启用，避免 407 弹框
+        ensure_stealth(page, log_callback=log_callback)
         page.get(SIGNUP_URL)
     except Exception as e:
         if log_callback:
             log_callback(f"[Debug] 打开URL异常: {e}")
         try:
-            page = browser.new_tab(SIGNUP_URL)
+            page = browser.new_tab()
+            ensure_stealth(page, log_callback=log_callback)
+            page.get(SIGNUP_URL)
         except Exception as e2:
             if log_callback:
                 log_callback(f"[Debug] 创建新标签页异常: {e2}")
             restart_browser()
-            page = browser.new_tab(SIGNUP_URL)
+            browser = get_browser()
+            page = browser.new_tab()
+            ensure_stealth(page, log_callback=log_callback)
+            page.get(SIGNUP_URL)
+    set_page(page)
+    ensure_stealth(page, log_callback=log_callback)
     page.wait.doc_loaded()
     sleep_with_cancel(2, cancel_callback)
     if log_callback:
         log_callback(f"[*] 当前URL: {page.url}")
+    status = check_page_blocked(
+        page, cancel_callback=cancel_callback, log_callback=log_callback
+    )
+    if status != "ok":
+        reason = "页面无法打开" if status == "unreachable" else "被 Cloudflare 拦截"
+        if _can_switch_ip():
+            raise ProxySwitchNeeded(reason)
+        if log_callback:
+            log_callback(f"[!] {reason}，且无可切换的备用 IP，继续尝试当前流程")
     click_email_signup_button(
         log_callback=log_callback, cancel_callback=cancel_callback
     )
@@ -1829,6 +2373,7 @@ def open_signup_page(log_callback=None, cancel_callback=None):
 
 def has_profile_form(log_callback=None):
     refresh_active_page()
+    page = get_page()
     try:
         return bool(
             page.run_js(
@@ -1855,6 +2400,7 @@ def fill_email_and_submit(timeout=45, log_callback=None, cancel_callback=None):
     last_diag_time = 0
     last_reclick_time = 0
     last_snapshot = None
+    page = get_page()
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
         filled = page.run_js(
@@ -2118,6 +2664,7 @@ return false;
             """
         )
 
+    page = get_page()
     code = get_oai_code(
         dev_token,
         email,
@@ -2247,7 +2794,7 @@ return 'clicked';
 
 
 def getTurnstileToken(log_callback=None, cancel_callback=None):
-    global page
+    page = get_page()
     if page is None:
         raise Exception("页面未就绪，无法执行 Turnstile")
 
@@ -2357,6 +2904,7 @@ def fill_profile_and_submit(timeout=120, log_callback=None, cancel_callback=None
     form_filled_once = False
     wait_cf_since = None
     last_cf_retry_at = 0.0
+    page = get_page()
 
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
@@ -2599,6 +3147,7 @@ def wait_for_sso_cookie(timeout=120, log_callback=None, cancel_callback=None):
         raise_if_cancelled(cancel_callback)
         try:
             refresh_active_page()
+            page = get_page()
             if page is None:
                 sleep_with_cancel(1, cancel_callback)
                 continue
@@ -2730,240 +3279,678 @@ return String(cfInput.value || '').trim().length;
     )
 
 
+# ============ 并发编排 ============
+
+class _BatchState:
+    """一次批量注册的共享状态（线程安全）。"""
+
+    def __init__(self, target, accounts_output_file, log_base, should_stop, on_stats):
+        self.lock = threading.Lock()
+        self.next_slot = 0
+        self.target = int(target)
+        self.success = 0
+        self.fail = 0
+        self.results = []
+        self.accounts_output_file = accounts_output_file
+        self._log_base = log_base
+        self.should_stop = should_stop
+        self._on_stats = on_stats
+
+    def claim(self):
+        with self.lock:
+            if self.next_slot >= self.target:
+                return None
+            s = self.next_slot
+            self.next_slot += 1
+            return s
+
+    def log(self, msg):
+        self._log_base(f"{worker_tag()}{msg}")
+
+    def on_success(self, rec=None):
+        with self.lock:
+            self.success += 1
+            if rec:
+                self.results.append(rec)
+        if self._on_stats:
+            self._on_stats(self.success, self.fail)
+
+    def on_fail(self):
+        with self.lock:
+            self.fail += 1
+        if self._on_stats:
+            self._on_stats(self.success, self.fail)
+
+
+def register_one_account(state, log):
+    """跑完一个账号的完整流程（假设本 worker 的浏览器/画像已就绪）。
+    成功则写文件/入池并计数；失败抛异常（含 ProxySwitchNeeded/AccountRetryNeeded）。"""
+    mail_cred_path = os.path.join(os.path.dirname(__file__), "mail_credentials.txt")
+    email = ""
+    dev_token = ""
+    code = ""
+    mail_ok = False
+    max_mail_retry = 3
+    for mail_try in range(1, max_mail_retry + 1):
+        log(f"[*] 1. 打开注册页 (尝试 {mail_try}/{max_mail_retry})")
+        open_signup_page(log_callback=log, cancel_callback=state.should_stop)
+        log("[*] 2. 创建邮箱并提交")
+        email, dev_token = fill_email_and_submit(log_callback=log, cancel_callback=state.should_stop)
+        log(f"[*] 邮箱: {email}")
+        log(f"[Debug] 邮箱credential(jwt): {dev_token}")
+        try:
+            with _output_lock:
+                with open(mail_cred_path, "a", encoding="utf-8") as f:
+                    f.write(f"{email}\t{dev_token}\n")
+        except Exception:
+            pass
+        log("[*] 3. 拉取验证码")
+        try:
+            code = fill_code_and_submit(email, dev_token, log_callback=log, cancel_callback=state.should_stop)
+            mail_ok = True
+            break
+        except Exception as mail_exc:
+            msg = str(mail_exc)
+            if state.should_stop():
+                raise RegistrationCancelled("用户停止注册")
+            if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
+                log(f"[!] 本邮箱未取到验证码，自动更换新邮箱重试: {msg}")
+                restart_browser(log_callback=log)
+                sleep_with_cancel(1, state.should_stop)
+                continue
+            raise
+    if not mail_ok:
+        raise Exception("验证码阶段失败，已达到最大重试次数")
+    log(f"[*] 验证码: {code}")
+    log("[*] 4. 填写资料")
+    profile = fill_profile_and_submit(log_callback=log, cancel_callback=state.should_stop)
+    log(f"[*] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
+    log("[*] 5. 等待 sso cookie")
+    sso = wait_for_sso_cookie(log_callback=log, cancel_callback=state.should_stop)
+
+    cpa_thread = None
+    cpa_result_box = {}
+    _cpa_page = get_page()
+    if config.get("cpa_export_enabled", True):
+        log("[*] 6. CPA xAI 导出 (OIDC refreshToken) — 复用注册浏览器")
+
+        def _cpa_mint():
+            try:
+                cpa_result_box["result"] = export_cpa_xai_for_account(
+                    email, profile.get("password", ""), sso=sso, log_callback=log, page=_cpa_page
+                )
+            except Exception as e:
+                cpa_result_box["result"] = {"ok": False, "error": str(e)}
+
+        cpa_thread = threading.Thread(target=_cpa_mint, daemon=True)
+        cpa_thread.start()
+    if config.get("enable_nsfw", True):
+        log("[*] 6. 开启 NSFW")
+        nsfw_ok, nsfw_msg = enable_nsfw_for_token(sso, log_callback=log)
+        if nsfw_ok:
+            log(f"[+] NSFW 开启成功: {nsfw_msg}")
+        else:
+            log(f"[!] NSFW 未开启，继续保存账号: {nsfw_msg}")
+    if cpa_thread is not None:
+        log("[*] 等待 CPA xAI 导出完成...")
+        cpa_thread.join(timeout=float(config.get("cpa_mint_timeout_sec", 240) or 240))
+        cpa_result = cpa_result_box.get("result", {"ok": False, "error": "timeout"})
+        if cpa_result.get("ok"):
+            log(f"[+] CPA xAI 导出成功: {cpa_result.get('path', '')}")
+        elif cpa_result.get("skipped"):
+            log("[cpa] CPA 导出已跳过")
+        else:
+            log(f"[!] CPA xAI 导出失败: {cpa_result.get('error', '未知错误')}")
+
+    try:
+        with _output_lock:
+            with open(state.accounts_output_file, "a", encoding="utf-8") as f:
+                f.write(f"{email}----{profile.get('password','')}----{sso}\n")
+    except Exception as file_exc:
+        log(f"[Debug] 保存账号文件失败: {file_exc}")
+    add_token_to_grok2api_pools(sso, email=email, log_callback=log)
+    add_token_to_token_only_file(sso, log_callback=log)
+    state.on_success({"email": email, "sso": sso, "profile": profile})
+    log(f"[+] 注册成功: {email}")
+
+
+def _worker_loop(state, worker_id):
+    _tls.tag = f"[W{worker_id}] " if worker_id else ""
+    log = state.log
+    max_slot_retry = 3
+    try:
+        while True:
+            if state.should_stop():
+                break
+            slot = state.claim()
+            if slot is None:
+                break
+            stop_browser()
+            start_new_account_profile(log_callback=log, cancel=state.should_stop)
+            if state.should_stop():
+                stop_browser()
+                break
+            start_browser(log_callback=log)
+            if state.should_stop():
+                stop_browser()
+                break
+            log(f"--- 开始第 {slot + 1}/{state.target} 个账号 ---")
+            ip_switch_count = 0
+            retry_count = 0
+            while True:
+                try:
+                    register_one_account(state, log)
+                    break
+                except RegistrationCancelled:
+                    break
+                except ProxySwitchNeeded as exc:
+                    if state.should_stop():
+                        break
+                    budget = _proxy_pool.ip_budget(config.get("max_ip_retry", 3)) if _proxy_pool else 1
+                    ip_switch_count += 1
+                    if ip_switch_count < budget and _can_switch_ip():
+                        log(f"[!] {exc}，切换下一个 IP 重试当前账号 ({ip_switch_count}/{budget})")
+                        switch_to_next_ip(log_callback=log, cancel=state.should_stop)
+                        restart_browser(log_callback=log)
+                        continue
+                    state.on_fail()
+                    log(f"[-] 换 IP 重试已达上限，跳过当前账号: {exc}")
+                    break
+                except AccountRetryNeeded as exc:
+                    if state.should_stop():
+                        break
+                    retry_count += 1
+                    if retry_count <= max_slot_retry:
+                        log(f"[!] 当前账号流程卡住，重试第 {retry_count}/{max_slot_retry} 次: {exc}")
+                        restart_browser(log_callback=log)
+                        continue
+                    state.on_fail()
+                    log(f"[-] 当前账号已达到最大重试次数，跳过: {exc}")
+                    break
+                except Exception as exc:
+                    if state.should_stop():
+                        break
+                    state.on_fail()
+                    log(f"[-] 注册失败: {exc}")
+                    break
+    finally:
+        stop_browser()
+        release_current_proxy()
+        try:
+            bp.cleanup_profile(get_profile())
+        except Exception:
+            pass
+
+
+def run_batch(count, log_base, should_stop, on_stats=None, accounts_output_file="", concurrency=1):
+    """并发编排：启动 N 个 worker，各自独立浏览器，共同完成 count 个账号。返回 (成功, 失败)。"""
+    init_proxy_pool(log_callback=log_base)
+    try:
+        n = max(1, int(concurrency))
+    except Exception:
+        n = 1
+    if _proxy_pool and _proxy_pool.mode == "pool" and _proxy_pool.size() > 0 and n > _proxy_pool.size():
+        log_base(f"[*] 并发数 {n} 超过代理池大小 {_proxy_pool.size()}，多出的 worker 将排队等待空闲 IP")
+    n = min(n, max(1, int(count)))
+    state = _BatchState(count, accounts_output_file, log_base, should_stop, on_stats)
+    if n > 1:
+        log_base(f"[*] 并发数: {n}")
+    threads = []
+    for wid in range(1, n + 1):
+        t = threading.Thread(target=_worker_loop, args=(state, wid if n > 1 else 0), daemon=True)
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join()
+    return state.success, state.fail
+
+
 class GrokRegisterGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("Grok 注册机")
-        self.root.geometry("1120x900")
-        self.root.minsize(960, 700)
+        self.root.title("Grok Register Studio")
+        self.root.geometry("1180x860")
+        self.root.minsize(1040, 680)
         self.is_running = False
         self.batch_count = 0
         self.success_count = 0
         self.fail_count = 0
+        self.target_count = 0
         self.results = []
         self.stop_requested = False
         self.ui_queue = queue.Queue()
         self.accounts_output_file = ""
+        self._pulse_on = False
+        self._pulse_step = 0
         self.setup_ui()
 
     def setup_ui(self):
         load_config()
-        main_frame = tk.Frame(self.root, bg=UI_BG, padx=10, pady=10)
-        main_frame.pack(fill=tk.BOTH, expand=True)
-        main_frame.grid_columnconfigure(0, weight=1)
-        main_frame.grid_rowconfigure(3, weight=1)
+        root = self.root
+        root.configure(bg=UI_BG)
 
-        config_frame = tk.LabelFrame(
-            main_frame,
-            text="配置",
-            bg=UI_PANEL_BG,
-            fg=UI_FG,
-            padx=10,
-            pady=10,
-            relief=tk.GROOVE,
-            borderwidth=1,
-        )
-        config_frame.grid(row=0, column=0, sticky=tk.EW, pady=(0, 8))
-        config_frame.grid_columnconfigure(1, weight=1, minsize=260)
-        config_frame.grid_columnconfigure(3, weight=1, minsize=260)
+        # ===== 顶栏 =====
+        header = tk.Frame(root, bg=UI_HEADER_BG, height=66)
+        header.pack(fill=tk.X, side=tk.TOP)
+        header.pack_propagate(False)
 
-        def add_label(row, column, text):
-            tk_label(config_frame, text=text, bg=UI_PANEL_BG).grid(
-                row=row,
-                column=column,
-                sticky=tk.W,
-                padx=(0, 6),
-                pady=3,
-            )
+        title_wrap = tk.Frame(header, bg=UI_HEADER_BG)
+        title_wrap.pack(side=tk.LEFT, padx=20)
+        tk.Label(title_wrap, text="⚡ Grok Register Studio", bg=UI_HEADER_BG, fg=UI_FG,
+                 font=(UI_FONT, 16, "bold")).pack(anchor="w", pady=(13, 0))
+        tk.Label(title_wrap, text="自动注册工作台 · Turnstile · 代理池 · 指纹",
+                 bg=UI_HEADER_BG, fg=UI_MUTED_FG, font=(UI_FONT, 9)).pack(anchor="w")
 
-        def add_field(widget, row, column, columnspan=1, sticky=tk.EW):
-            widget.grid(
-                row=row,
-                column=column,
-                columnspan=columnspan,
-                sticky=sticky,
-                padx=(0, 14),
-                pady=3,
-            )
-
-        add_label(0, 0, "邮箱服务商:")
-        self.email_provider_var = tk.StringVar(value=config.get("email_provider", "duckmail"))
-        self.email_provider_combo = tk_option_menu(config_frame, self.email_provider_var, ["templol", "duckmail", "yyds", "cloudflare"], width=12)
-        add_field(self.email_provider_combo, 0, 1, sticky=tk.W)
-
-        add_label(0, 2, "注册数量:")
-        self.count_var = tk.StringVar(value=str(config.get("register_count", 1)))
-        self.count_spinbox = tk.Spinbox(
-            config_frame,
-            from_=1,
-            to=2500,
-            width=8,
-            textvariable=self.count_var,
-            bg=UI_ENTRY_BG,
-            fg=UI_FG,
-            insertbackground=UI_FG,
-            buttonbackground=UI_BUTTON_BG,
-            disabledbackground="#2f2f2f",
-            disabledforeground=UI_MUTED_FG,
-            relief=tk.SOLID,
-        )
-        add_field(self.count_spinbox, 0, 3, sticky=tk.W)
-
-        add_label(1, 0, "注册选项:")
-        self.nsfw_var = tk.BooleanVar(value=config.get("enable_nsfw", True))
-        self.nsfw_check = tk_checkbutton(config_frame, text="注册后开启 NSFW", variable=self.nsfw_var)
-        add_field(self.nsfw_check, 1, 1, sticky=tk.W)
-
-        add_label(1, 2, "代理（可选）:")
-        self.proxy_var = tk.StringVar(value=config.get("proxy", ""))
-        self.proxy_entry = tk_entry(config_frame, textvariable=self.proxy_var, width=34)
-        add_field(self.proxy_entry, 1, 3)
-
-        add_label(2, 0, "DuckMail API Key:")
-        self.api_key_var = tk.StringVar(value=config.get("duckmail_api_key", ""))
-        self.api_key_entry = tk_entry(config_frame, textvariable=self.api_key_var, width=34)
-        add_field(self.api_key_entry, 2, 1)
-
-        add_label(2, 2, "Cloudflare 鉴权模式:")
-        self.cloudflare_auth_mode_var = tk.StringVar(value=config.get("cloudflare_auth_mode", "none"))
-        self.cloudflare_auth_mode_combo = tk_option_menu(
-            config_frame, self.cloudflare_auth_mode_var, ["query-key", "bearer", "x-api-key", "x-admin-auth", "none"], width=12
-        )
-        add_field(self.cloudflare_auth_mode_combo, 2, 3, sticky=tk.W)
-
-        add_label(3, 0, "Cloudflare API Base:")
-        self.cloudflare_api_base_var = tk.StringVar(value=config.get("cloudflare_api_base", ""))
-        self.cloudflare_api_base_entry = tk_entry(config_frame, textvariable=self.cloudflare_api_base_var, width=72)
-        add_field(self.cloudflare_api_base_entry, 3, 1, columnspan=3)
-
-        add_label(4, 0, "Cloudflare API Key:")
-        self.cloudflare_api_key_var = tk.StringVar(value=config.get("cloudflare_api_key", ""))
-        self.cloudflare_api_key_entry = tk_entry(config_frame, textvariable=self.cloudflare_api_key_var, width=34)
-        add_field(self.cloudflare_api_key_entry, 4, 1)
-
-        add_label(4, 2, "CF 路径:")
-        self.cloudflare_paths_var = tk.StringVar(
-            value=",".join(
-                [
-                    config.get("cloudflare_path_domains", "/api/domains"),
-                    config.get("cloudflare_path_accounts", "/api/new_address"),
-                    config.get("cloudflare_path_token", "/api/token"),
-                    config.get("cloudflare_path_messages", "/api/mails"),
-                ]
-            )
-        )
-        self.cloudflare_paths_entry = tk_entry(config_frame, textvariable=self.cloudflare_paths_var, width=34)
-        add_field(self.cloudflare_paths_entry, 4, 3)
-
-        add_label(5, 0, "grok2api 本地入池:")
-        self.grok2api_local_auto_var = tk.BooleanVar(value=bool(config.get("grok2api_auto_add_local", True)))
-        self.grok2api_local_auto_check = tk_checkbutton(config_frame, variable=self.grok2api_local_auto_var)
-        add_field(self.grok2api_local_auto_check, 5, 1, sticky=tk.W)
-
-        add_label(5, 2, "grok2api 池名:")
-        self.grok2api_pool_name_var = tk.StringVar(value=str(config.get("grok2api_pool_name", "ssoBasic")))
-        self.grok2api_pool_name_combo = tk_option_menu(
-            config_frame, self.grok2api_pool_name_var, ["ssoBasic", "ssoSuper"], width=12
-        )
-        add_field(self.grok2api_pool_name_combo, 5, 3, sticky=tk.W)
-
-        add_label(6, 0, "本地 token.json:")
-        self.grok2api_local_file_var = tk.StringVar(value=str(config.get("grok2api_local_token_file", "")))
-        self.grok2api_local_file_entry = tk_entry(config_frame, textvariable=self.grok2api_local_file_var, width=72)
-        add_field(self.grok2api_local_file_entry, 6, 1, columnspan=3)
-
-        add_label(7, 0, "grok2api 远端入池:")
-        self.grok2api_remote_auto_var = tk.BooleanVar(value=bool(config.get("grok2api_auto_add_remote", False)))
-        self.grok2api_remote_auto_check = tk_checkbutton(config_frame, variable=self.grok2api_remote_auto_var)
-        add_field(self.grok2api_remote_auto_check, 7, 1, sticky=tk.W)
-
-        add_label(8, 0, "grok2api 远端 Base:")
-        self.grok2api_remote_base_var = tk.StringVar(value=str(config.get("grok2api_remote_base", "")))
-        self.grok2api_remote_base_entry = tk_entry(config_frame, textvariable=self.grok2api_remote_base_var, width=72)
-        add_field(self.grok2api_remote_base_entry, 8, 1, columnspan=3)
-
-        add_label(9, 0, "grok2api 远端 app_key:")
-        self.grok2api_remote_key_var = tk.StringVar(value=str(config.get("grok2api_remote_app_key", "")))
-        self.grok2api_remote_key_entry = tk_entry(config_frame, textvariable=self.grok2api_remote_key_var, width=72)
-        add_field(self.grok2api_remote_key_entry, 9, 1, columnspan=3)
-
-        add_label(10, 0, "TempMail.lol Key:")
-        self.templol_api_key_var = tk.StringVar(value=str(config.get("templol_api_key", "")))
-        self.templol_api_key_entry = tk_entry(config_frame, textvariable=self.templol_api_key_var, width=34)
-        add_field(self.templol_api_key_entry, 10, 1)
-
-        add_label(10, 2, "TempMail.lol 域名:")
-        self.templol_domains_var = tk.StringVar(value=str(config.get("templol_domains", "")))
-        self.templol_domains_entry = tk_entry(config_frame, textvariable=self.templol_domains_var, width=34)
-        add_field(self.templol_domains_entry, 10, 3)
-
-        btn_frame = tk.Frame(main_frame, bg=UI_BG)
-        btn_frame.grid(row=1, column=0, sticky=tk.EW, pady=(0, 6))
-        self.start_btn = tk_button(btn_frame, text="开始注册", command=self.start_registration)
-        self.start_btn.pack(side=tk.LEFT, padx=5)
-        self.stop_btn = tk_button(btn_frame, text="停止", command=self.stop_registration, state=tk.DISABLED)
-        self.stop_btn.pack(side=tk.LEFT, padx=5)
-        self.clear_btn = tk_button(btn_frame, text="清空日志", command=self.clear_log)
-        self.clear_btn.pack(side=tk.LEFT, padx=5)
-
-        status_frame = tk.Frame(main_frame, bg=UI_BG)
-        status_frame.grid(row=2, column=0, sticky=tk.EW, pady=(0, 6))
+        status_wrap = tk.Frame(header, bg=UI_HEADER_BG)
+        status_wrap.pack(side=tk.RIGHT, padx=20)
+        self.pulse_canvas = tk.Canvas(status_wrap, width=14, height=14, bg=UI_HEADER_BG,
+                                      highlightthickness=0)
+        self.pulse_canvas.pack(side=tk.LEFT, padx=(0, 8))
+        self._pulse_dot = self.pulse_canvas.create_oval(3, 3, 12, 12, fill=UI_SUCCESS, outline="")
         self.status_var = tk.StringVar(value="就绪")
-        tk_label(status_frame, text="状态: ").pack(side=tk.LEFT)
-        self.status_label = tk.Label(status_frame, textvariable=self.status_var, bg=UI_BG, fg="green")
+        self.status_label = tk.Label(status_wrap, textvariable=self.status_var, bg=UI_HEADER_BG,
+                                     fg=UI_SUCCESS, font=(UI_FONT, 11, "bold"))
         self.status_label.pack(side=tk.LEFT)
-        self.stats_var = tk.StringVar(value="成功: 0 | 失败: 0")
-        tk.Label(status_frame, textvariable=self.stats_var, bg=UI_BG, fg=UI_FG).pack(side=tk.RIGHT)
-        log_frame = tk.LabelFrame(
-            main_frame,
-            text="日志",
-            bg=UI_PANEL_BG,
-            fg=UI_FG,
-            padx=5,
-            pady=5,
-            relief=tk.GROOVE,
-            borderwidth=1,
-        )
-        log_frame.grid(row=3, column=0, sticky=tk.NSEW)
-        log_frame.grid_columnconfigure(0, weight=1)
-        log_frame.grid_rowconfigure(0, weight=1)
-        self.log_text = scrolledtext.ScrolledText(
-            log_frame,
-            height=18,
-            width=60,
-            bg="#111111",
-            fg="#f5f5f5",
-            insertbackground="#f5f5f5",
-            selectbackground="#345a8a",
-            selectforeground="#ffffff",
-            relief=tk.SOLID,
-            borderwidth=1,
-            highlightthickness=1,
-            highlightbackground="#555555",
-        )
-        self.log_text.grid(row=0, column=0, sticky=tk.NSEW)
+
+        tk.Frame(root, bg=UI_BORDER, height=1).pack(fill=tk.X)
+
+        # ===== 主体：左右分栏 =====
+        body = tk.Frame(root, bg=UI_BG)
+        body.pack(fill=tk.BOTH, expand=True, padx=16, pady=14)
+        body.grid_columnconfigure(0, minsize=486)
+        body.grid_columnconfigure(1, weight=1)
+        body.grid_rowconfigure(0, weight=1)
+
+        # --- 左：配置 ---
+        left = tk.Frame(body, bg=UI_BG)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 14))
+        left.grid_rowconfigure(0, weight=1)
+        left.grid_columnconfigure(0, weight=1)
+
+        nb = ttk.Notebook(left)
+        nb.grid(row=0, column=0, sticky="nsew")
+        tab_general = self._make_tab(nb, "  常规  ")
+        tab_mail = self._make_tab(nb, "  邮箱  ")
+        tab_pool = self._make_tab(nb, "  入池  ")
+
+        # ---- 常规 ----
+        r = 0
+        self.email_provider_var = tk.StringVar(value=config.get("email_provider", "duckmail"))
+        self.email_provider_combo = tk_combo(tab_general, self.email_provider_var, ["templol", "duckmail", "yyds", "cloudflare"], width=16)
+        r = self._field(tab_general, r, "邮箱服务商", self.email_provider_combo, stretch=False)
+
+        self.count_var = tk.StringVar(value=str(config.get("register_count", 1)))
+        self.count_spinbox = tk_spinbox(tab_general, self.count_var, 1, 2500, width=10)
+        r = self._field(tab_general, r, "注册数量", self.count_spinbox, stretch=False)
+
+        self.proxy_mode_var = tk.StringVar(value=config.get("proxy_mode", "single"))
+        self.proxy_mode_combo = tk_combo(tab_general, self.proxy_mode_var, ["single", "pool"], width=16)
+        self.proxy_mode_combo.bind("<<ComboboxSelected>>", self._update_proxy_mode_state)
+        r = self._field(tab_general, r, "代理模式", self.proxy_mode_combo, stretch=False)
+
+        self.proxy_var = tk.StringVar(value=config.get("proxy", ""))
+        self.proxy_entry = tk_entry(tab_general, textvariable=self.proxy_var)
+        r = self._field(tab_general, r, "代理地址", self.proxy_entry, hint="single 模式使用")
+
+        self.proxy_pool_text = tk_text(tab_general, height=4)
+        _pv = config.get("proxy_pool", [])
+        if isinstance(_pv, (list, tuple)):
+            _pv = "\n".join(str(x) for x in _pv)
+        else:
+            _pv = str(_pv).replace(",", "\n")
+        if _pv.strip():
+            self.proxy_pool_text.insert("1.0", _pv.strip())
+        r = self._field_multiline(tab_general, r, "代理池", self.proxy_pool_text, hint="每行一个代理，pool 模式使用")
+
+        self.max_ip_retry_var = tk.StringVar(value=str(config.get("max_ip_retry", 3)))
+        self.max_ip_retry_spinbox = tk_spinbox(tab_general, self.max_ip_retry_var, 1, 50, width=10)
+        r = self._field(tab_general, r, "换 IP 重试上限", self.max_ip_retry_spinbox, stretch=False)
+
+        self.concurrency_var = tk.StringVar(value=str(config.get("concurrency", 1)))
+        self.concurrency_spinbox = tk_spinbox(tab_general, self.concurrency_var, 1, 8, width=10)
+        r = self._field(tab_general, r, "并发数", self.concurrency_spinbox, stretch=False,
+                        hint="每个并发各开一个浏览器；pool 模式每 worker 不同 IP")
+
+        r = self._divider(tab_general, r)
+
+        self.nsfw_var = tk.BooleanVar(value=config.get("enable_nsfw", True))
+        self.nsfw_check = tk_checkbutton(tab_general, text="注册后开启 NSFW", variable=self.nsfw_var, bg=UI_PANEL_ALT)
+        r = self._field(tab_general, r, None, self.nsfw_check)
+
+        self.anti_fp_var = tk.BooleanVar(value=bool(config.get("anti_fingerprint", True)))
+        self.anti_fp_check = tk_checkbutton(tab_general, text="指纹随机化（随机视口/语言）", variable=self.anti_fp_var, bg=UI_PANEL_ALT)
+        r = self._field(tab_general, r, None, self.anti_fp_check)
+
+        self.cpa_export_var = tk.BooleanVar(value=bool(config.get("cpa_export_enabled", True)))
+        self.cpa_export_check = tk_checkbutton(tab_general, text="CPA 导出 OIDC refreshToken（需浏览器）", variable=self.cpa_export_var, bg=UI_PANEL_ALT)
+        r = self._field(tab_general, r, None, self.cpa_export_check)
+
+        # ---- 邮箱 ----
+        r = 0
+        r = self._subhead(tab_mail, r, "TempMail.lol（推荐，零配置）")
+        self.templol_api_key_var = tk.StringVar(value=str(config.get("templol_api_key", "")))
+        self.templol_api_key_entry = tk_entry(tab_mail, textvariable=self.templol_api_key_var)
+        r = self._field(tab_mail, r, "API Key", self.templol_api_key_entry)
+        self.templol_domains_var = tk.StringVar(value=str(config.get("templol_domains", "")))
+        self.templol_domains_entry = tk_entry(tab_mail, textvariable=self.templol_domains_var)
+        r = self._field(tab_mail, r, "自定义域名", self.templol_domains_entry)
+
+        r = self._subhead(tab_mail, r, "DuckMail")
+        self.api_key_var = tk.StringVar(value=config.get("duckmail_api_key", ""))
+        self.api_key_entry = tk_entry(tab_mail, textvariable=self.api_key_var)
+        r = self._field(tab_mail, r, "API Key", self.api_key_entry)
+
+        r = self._subhead(tab_mail, r, "Cloudflare 临时邮箱")
+        self.cloudflare_auth_mode_var = tk.StringVar(value=config.get("cloudflare_auth_mode", "none"))
+        self.cloudflare_auth_mode_combo = tk_combo(tab_mail, self.cloudflare_auth_mode_var, ["none", "query-key", "bearer", "x-api-key", "x-admin-auth"], width=18)
+        r = self._field(tab_mail, r, "鉴权模式", self.cloudflare_auth_mode_combo, stretch=False)
+        self.cloudflare_api_base_var = tk.StringVar(value=config.get("cloudflare_api_base", ""))
+        self.cloudflare_api_base_entry = tk_entry(tab_mail, textvariable=self.cloudflare_api_base_var)
+        r = self._field(tab_mail, r, "API Base", self.cloudflare_api_base_entry)
+        self.cloudflare_api_key_var = tk.StringVar(value=config.get("cloudflare_api_key", ""))
+        self.cloudflare_api_key_entry = tk_entry(tab_mail, textvariable=self.cloudflare_api_key_var)
+        r = self._field(tab_mail, r, "API Key", self.cloudflare_api_key_entry)
+        self.cloudflare_paths_var = tk.StringVar(value=",".join([
+            config.get("cloudflare_path_domains", "/api/domains"),
+            config.get("cloudflare_path_accounts", "/api/new_address"),
+            config.get("cloudflare_path_token", "/api/token"),
+            config.get("cloudflare_path_messages", "/api/mails"),
+        ]))
+        self.cloudflare_paths_entry = tk_entry(tab_mail, textvariable=self.cloudflare_paths_var)
+        r = self._field(tab_mail, r, "CF 路径", self.cloudflare_paths_entry, hint="domains,accounts,token,messages")
+
+        # ---- 入池 ----
+        r = 0
+        r = self._subhead(tab_pool, r, "本地 grok2api")
+        self.grok2api_local_auto_var = tk.BooleanVar(value=bool(config.get("grok2api_auto_add_local", True)))
+        self.grok2api_local_auto_check = tk_checkbutton(tab_pool, text="写入本地 token.json", variable=self.grok2api_local_auto_var, bg=UI_PANEL_ALT)
+        r = self._field(tab_pool, r, None, self.grok2api_local_auto_check)
+        self.grok2api_pool_name_var = tk.StringVar(value=str(config.get("grok2api_pool_name", "ssoBasic")))
+        self.grok2api_pool_name_combo = tk_combo(tab_pool, self.grok2api_pool_name_var, ["ssoBasic", "ssoSuper"], width=16)
+        r = self._field(tab_pool, r, "池名", self.grok2api_pool_name_combo, stretch=False)
+        self.grok2api_local_file_var = tk.StringVar(value=str(config.get("grok2api_local_token_file", "")))
+        self.grok2api_local_file_entry = tk_entry(tab_pool, textvariable=self.grok2api_local_file_var)
+        r = self._field(tab_pool, r, "token.json 路径", self.grok2api_local_file_entry, hint="留空则用程序目录")
+
+        r = self._subhead(tab_pool, r, "远端 grok2api")
+        self.grok2api_remote_auto_var = tk.BooleanVar(value=bool(config.get("grok2api_auto_add_remote", False)))
+        self.grok2api_remote_auto_check = tk_checkbutton(tab_pool, text="写入远端 grok2api", variable=self.grok2api_remote_auto_var, bg=UI_PANEL_ALT)
+        r = self._field(tab_pool, r, None, self.grok2api_remote_auto_check)
+        self.grok2api_remote_base_var = tk.StringVar(value=str(config.get("grok2api_remote_base", "")))
+        self.grok2api_remote_base_entry = tk_entry(tab_pool, textvariable=self.grok2api_remote_base_var)
+        r = self._field(tab_pool, r, "远端 Base", self.grok2api_remote_base_entry)
+        self.grok2api_remote_key_var = tk.StringVar(value=str(config.get("grok2api_remote_app_key", "")))
+        self.grok2api_remote_key_entry = tk_entry(tab_pool, textvariable=self.grok2api_remote_key_var)
+        r = self._field(tab_pool, r, "远端 app_key", self.grok2api_remote_key_entry)
+
+        # 按钮区
+        btnbar = tk.Frame(left, bg=UI_BG)
+        btnbar.grid(row=1, column=0, sticky="ew", pady=(14, 0))
+        self.start_btn = make_button(btnbar, "▶  开始注册", command=self.start_registration, primary=True)
+        self.start_btn.pack(side=tk.LEFT)
+        self.stop_btn = make_button(btnbar, "■  停止", command=self.stop_registration, state=tk.DISABLED)
+        self.stop_btn.pack(side=tk.LEFT, padx=8)
+        self.clear_btn = make_button(btnbar, "清空日志", command=self.clear_log)
+        self.clear_btn.pack(side=tk.RIGHT)
+
+        # --- 右：仪表盘 ---
+        right = tk.Frame(body, bg=UI_BG)
+        right.grid(row=0, column=1, sticky="nsew")
+        right.grid_rowconfigure(2, weight=1)
+        right.grid_columnconfigure(0, weight=1)
+
+        cards = tk.Frame(right, bg=UI_BG)
+        cards.grid(row=0, column=0, sticky="ew")
+        for i in range(4):
+            cards.grid_columnconfigure(i, weight=1, uniform="stat")
+        self.card_success = self._make_stat_card(cards, 0, "成功", UI_SUCCESS)
+        self.card_fail = self._make_stat_card(cards, 1, "失败", UI_ERROR)
+        self.card_target = self._make_stat_card(cards, 2, "目标", UI_ACCENT)
+        self.card_progress = self._make_stat_card(cards, 3, "进度", UI_FG)
+
+        self.progress_var = tk.DoubleVar(value=0)
+        pb = ttk.Progressbar(right, style="Accent.Horizontal.TProgressbar",
+                             variable=self.progress_var, maximum=100)
+        pb.grid(row=1, column=0, sticky="ew", pady=(12, 14))
+
+        logcard = tk.Frame(right, bg=UI_PANEL_BG, highlightthickness=1, highlightbackground=UI_BORDER)
+        logcard.grid(row=2, column=0, sticky="nsew")
+        logcard.grid_rowconfigure(1, weight=1)
+        logcard.grid_columnconfigure(0, weight=1)
+        loghead = tk.Frame(logcard, bg=UI_PANEL_BG)
+        loghead.grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 8))
+        tk.Label(loghead, text="运行日志", bg=UI_PANEL_BG, fg=UI_FG, font=(UI_FONT, 11, "bold")).pack(side=tk.LEFT)
+        self.stats_var = tk.StringVar(value="成功 0 · 失败 0")
+        tk.Label(loghead, textvariable=self.stats_var, bg=UI_PANEL_BG, fg=UI_MUTED_FG, font=(UI_FONT, 9)).pack(side=tk.RIGHT)
+
+        logwrap = tk.Frame(logcard, bg=UI_LOG_BG)
+        logwrap.grid(row=1, column=0, sticky="nsew", padx=1, pady=(0, 1))
+        logwrap.grid_rowconfigure(0, weight=1)
+        logwrap.grid_columnconfigure(0, weight=1)
+        self.log_text = tk.Text(logwrap, bg=UI_LOG_BG, fg=UI_FG, insertbackground=UI_ACCENT,
+                                relief=tk.FLAT, bd=0, wrap="word", padx=12, pady=8,
+                                font=(UI_MONO_FONT, 10), selectbackground=UI_ACCENT_DIM,
+                                selectforeground=UI_FG)
+        self.log_text.grid(row=0, column=0, sticky="nsew")
+        sb = ttk.Scrollbar(logwrap, orient="vertical", style="Vertical.TScrollbar", command=self.log_text.yview)
+        sb.grid(row=0, column=1, sticky="ns")
+        self.log_text.configure(yscrollcommand=sb.set)
+        self._setup_log_tags()
+
+        self._update_proxy_mode_state()
+        self.update_stats()
         self.log("[*] GUI 已就绪，配置已加载")
-        self.log(f"[*] 当前邮箱服务商: {self.email_provider_var.get()} | 注册数量: {self.count_var.get()}")
+        self.log(f"[*] 当前邮箱服务商: {self.email_provider_var.get()} | 目标数量: {self.count_var.get()}")
+
+    # ===== UI 构建辅助 =====
+    def _make_tab(self, nb, title):
+        page = tk.Frame(nb, bg=UI_PANEL_ALT)
+        nb.add(page, text=title)
+        inner = tk.Frame(page, bg=UI_PANEL_ALT)
+        inner.pack(fill=tk.BOTH, expand=True, padx=8, pady=10)
+        inner.grid_columnconfigure(1, weight=1)
+        return inner
+
+    def _field(self, page, r, label_text, widget, stretch=True, hint=None):
+        if label_text is None:
+            widget.grid(row=r, column=0, columnspan=2, sticky="w", padx=14, pady=7)
+        else:
+            tk_label(page, text=label_text, bg=UI_PANEL_ALT, fg=UI_MUTED_FG).grid(
+                row=r, column=0, sticky="w", padx=(14, 12), pady=7)
+            widget.grid(row=r, column=1, sticky="ew" if stretch else "w", padx=(0, 14), pady=7)
+        r += 1
+        if hint:
+            tk.Label(page, text=hint, bg=UI_PANEL_ALT, fg=UI_DEBUG, font=(UI_FONT, 8)).grid(
+                row=r, column=1, sticky="w", padx=(0, 14), pady=(0, 4))
+            r += 1
+        return r
+
+    def _field_multiline(self, page, r, label_text, widget, hint=None):
+        tk_label(page, text=label_text, bg=UI_PANEL_ALT, fg=UI_MUTED_FG).grid(
+            row=r, column=0, sticky="nw", padx=(14, 12), pady=(9, 7))
+        widget.grid(row=r, column=1, sticky="ew", padx=(0, 14), pady=7)
+        r += 1
+        if hint:
+            tk.Label(page, text=hint, bg=UI_PANEL_ALT, fg=UI_DEBUG, font=(UI_FONT, 8)).grid(
+                row=r, column=1, sticky="w", padx=(0, 14), pady=(0, 4))
+            r += 1
+        return r
+
+    def _update_proxy_mode_state(self, *_):
+        is_pool = (self.proxy_mode_var.get() or "single").strip().lower() == "pool"
+        self._set_input_enabled(self.proxy_entry, not is_pool)
+        self._set_text_enabled(self.proxy_pool_text, is_pool)
+
+    def _set_input_enabled(self, widget, enabled):
+        try:
+            widget.config(state=(tk.NORMAL if enabled else tk.DISABLED))
+        except Exception:
+            pass
+
+    def _set_text_enabled(self, widget, enabled):
+        try:
+            if enabled:
+                widget.config(state=tk.NORMAL, bg=UI_ENTRY_BG, fg=UI_FG)
+            else:
+                widget.config(state=tk.DISABLED, bg=UI_PANEL_BG, fg=UI_MUTED_FG)
+        except Exception:
+            pass
+
+    def _subhead(self, page, r, text):
+        f = tk.Frame(page, bg=UI_PANEL_ALT)
+        f.grid(row=r, column=0, columnspan=2, sticky="ew", padx=14, pady=(12, 2))
+        tk.Frame(f, bg=UI_ACCENT, width=3, height=14).pack(side=tk.LEFT, padx=(0, 8))
+        tk.Label(f, text=text, bg=UI_PANEL_ALT, fg=UI_FG, font=(UI_FONT, 10, "bold")).pack(side=tk.LEFT)
+        return r + 1
+
+    def _divider(self, page, r):
+        tk.Frame(page, bg=UI_BORDER, height=1).grid(row=r, column=0, columnspan=2, sticky="ew", padx=14, pady=8)
+        return r + 1
+
+    def _make_stat_card(self, parent, col, title, color):
+        card = tk.Frame(parent, bg=UI_PANEL_BG, highlightthickness=1, highlightbackground=UI_BORDER)
+        card.grid(row=0, column=col, sticky="ew", padx=(0 if col == 0 else 10, 0))
+        tk.Frame(card, bg=color, width=3).pack(side=tk.LEFT, fill=tk.Y)
+        inner = tk.Frame(card, bg=UI_PANEL_BG)
+        inner.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=16, pady=12)
+        val = tk.Label(inner, text="0", bg=UI_PANEL_BG, fg=color, font=(UI_FONT, 24, "bold"))
+        val.pack(anchor="w")
+        tk.Label(inner, text=title, bg=UI_PANEL_BG, fg=UI_MUTED_FG, font=(UI_FONT, 9)).pack(anchor="w")
+        return val
+
+    # ===== 脉冲动画 =====
+    def _start_pulse(self):
+        if self._pulse_on:
+            return
+        self._pulse_on = True
+        self._pulse_step = 0
+        self._pulse()
+
+    def _pulse(self):
+        if not self._pulse_on:
+            return
+        import math
+        self._pulse_step = (self._pulse_step + 1) % 50
+        t = (math.sin(self._pulse_step / 50 * 2 * math.pi) + 1) / 2
+        try:
+            self.pulse_canvas.itemconfig(self._pulse_dot, fill=_blend_hex(UI_ACCENT_DIM, UI_ACCENT_HOVER, t))
+            self.root.after(70, self._pulse)
+        except Exception:
+            self._pulse_on = False
+
+    def _stop_pulse(self, color):
+        self._pulse_on = False
+        try:
+            self.pulse_canvas.itemconfig(self._pulse_dot, fill=color)
+        except Exception:
+            pass
+
+    # ===== 日志 =====
+    def _setup_log_tags(self):
+        self.log_text.tag_configure("ts", foreground=UI_DEBUG)
+        self.log_text.tag_configure("info", foreground=UI_FG)
+        self.log_text.tag_configure("ok", foreground=UI_SUCCESS)
+        self.log_text.tag_configure("warn", foreground=UI_WARN)
+        self.log_text.tag_configure("err", foreground=UI_ERROR)
+        self.log_text.tag_configure("debug", foreground=UI_DEBUG)
+        self.log_text.tag_configure("cpa", foreground=UI_CPA)
+
+    def _log_tag(self, text):
+        if text.startswith("[+]"):
+            return "ok"
+        if text.startswith("[!]"):
+            return "warn"
+        if text.startswith("[-]"):
+            return "err"
+        if text.startswith("[Debug]"):
+            return "debug"
+        if text.startswith("[cpa]"):
+            return "cpa"
+        return "info"
 
     def log(self, message):
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-        line = f"[{timestamp}] {message}"
-        print(line, flush=True)
-        self.log_text.insert(tk.END, f"{line}\n")
-        self.log_text.see(tk.END)
+        text = _sanitize_log_text(message)
+        try:
+            print(f"[{timestamp}] {text}", flush=True)
+        except Exception:
+            pass
+        try:
+            self.root.after(0, self._append_log, timestamp, text)
+        except Exception:
+            pass
+
+    def _append_log(self, timestamp, text):
+        try:
+            self.log_text.insert(tk.END, f"{timestamp}  ", ("ts",))
+            self.log_text.insert(tk.END, f"{text}\n", (self._log_tag(text),))
+            last = int(self.log_text.index("end-1c").split(".")[0])
+            if last > 2200:
+                self.log_text.delete("1.0", f"{last - 2000}.0")
+            self.log_text.see(tk.END)
+        except Exception:
+            pass
 
     def clear_log(self):
-        self.log_text.delete(1.0, tk.END)
+        try:
+            self.log_text.delete("1.0", tk.END)
+        except Exception:
+            pass
 
+    # ===== 统计 / 运行态 =====
     def update_stats(self):
-        self.stats_var.set(f"成功: {self.success_count} | 失败: {self.fail_count}")
+        try:
+            self.root.after(0, self._apply_stats)
+        except Exception:
+            pass
+
+    def _apply_stats(self):
+        target = self.target_count
+        if not target:
+            try:
+                target = int(self.count_var.get())
+            except Exception:
+                target = 0
+        done = self.success_count + self.fail_count
+        try:
+            self.card_success.config(text=str(self.success_count))
+            self.card_fail.config(text=str(self.fail_count))
+            self.card_target.config(text=str(target) if target else "—")
+            pct = int(done / target * 100) if target else 0
+            pct = max(0, min(100, pct))
+            self.card_progress.config(text=f"{pct}%")
+            self.progress_var.set(pct)
+            self.stats_var.set(f"成功 {self.success_count} · 失败 {self.fail_count}")
+        except Exception:
+            pass
+
+    def _set_btn_enabled(self, btn, enabled):
+        try:
+            if enabled:
+                btn.config(state=tk.NORMAL, bg=getattr(btn, "_base_bg", UI_BUTTON_BG))
+            else:
+                btn.config(state=tk.DISABLED, bg=UI_PANEL_ALT)
+        except Exception:
+            pass
 
     def _set_running_ui(self, running):
         self.is_running = running
-        self.start_btn.config(state=tk.DISABLED if running else tk.NORMAL)
-        self.stop_btn.config(state=tk.NORMAL if running else tk.DISABLED)
-        self.status_var.set("运行中..." if running else "就绪")
-        self.status_label.config(foreground="blue" if running else "green")
+        try:
+            self.root.after(0, self._apply_running_ui, running)
+        except Exception:
+            pass
+
+    def _apply_running_ui(self, running):
+        self._set_btn_enabled(self.start_btn, not running)
+        self._set_btn_enabled(self.stop_btn, running)
+        if running:
+            self.status_var.set("运行中")
+            self.status_label.config(fg=UI_ACCENT)
+            self._start_pulse()
+        else:
+            self.status_var.set("就绪")
+            self.status_label.config(fg=UI_SUCCESS)
+            self._stop_pulse(UI_SUCCESS)
 
     def should_stop(self):
         return self.stop_requested or not self.is_running
@@ -2976,6 +3963,18 @@ class GrokRegisterGUI:
         config["email_provider"] = self.email_provider_var.get().strip() or "duckmail"
         config["enable_nsfw"] = bool(self.nsfw_var.get())
         config["proxy"] = self.proxy_var.get().strip()
+        config["proxy_mode"] = self.proxy_mode_var.get().strip() or "single"
+        config["proxy_pool"] = bp.normalize_proxy_list(self.proxy_pool_text.get("1.0", tk.END))
+        config["anti_fingerprint"] = bool(self.anti_fp_var.get())
+        config["cpa_export_enabled"] = bool(self.cpa_export_var.get())
+        try:
+            config["max_ip_retry"] = max(1, int(self.max_ip_retry_var.get()))
+        except Exception:
+            config["max_ip_retry"] = 3
+        try:
+            config["concurrency"] = max(1, int(self.concurrency_var.get()))
+        except Exception:
+            config["concurrency"] = 1
         config["duckmail_api_key"] = self.api_key_var.get().strip()
         config["templol_api_key"] = self.templol_api_key_var.get().strip()
         config["templol_domains"] = self.templol_domains_var.get().strip()
@@ -3008,6 +4007,7 @@ class GrokRegisterGUI:
         self.stop_requested = False
         self.success_count = 0
         self.fail_count = 0
+        self.target_count = count
         self.results = []
         now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         self.accounts_output_file = os.path.join(
@@ -3024,162 +4024,41 @@ class GrokRegisterGUI:
         ).start()
 
     def stop_registration(self):
+        if not self.is_running:
+            return
         self.stop_requested = True
-        self.log("[!] 用户停止注册")
+        self.log("[!] 用户停止注册，正在关闭浏览器…")
+        # 立即反馈：状态改「停止中」，禁用停止按钮防重复点击
+        try:
+            self.status_var.set("停止中…")
+            self.status_label.config(fg=UI_WARN)
+            self._stop_pulse(UI_WARN)
+            self.stop_btn.config(state=tk.DISABLED, bg=UI_PANEL_ALT)
+        except Exception:
+            pass
+        # 强制关闭所有浏览器，打断卡在死代理导航里的 worker（放后台线程，避免卡 UI）
+        threading.Thread(target=force_stop_all_browsers, daemon=True).start()
 
     def run_registration(self, count):
         try:
-            start_browser(log_callback=self.log)
-            self.log("[*] 浏览器已启动")
-            i = 0
-            retry_count_for_slot = 0
-            max_slot_retry = 3
-            while i < count:
-                if self.should_stop():
-                    break
-                self.log(f"--- 开始第 {i + 1}/{count} 个账号 ---")
-                try:
-                    email = ""
-                    dev_token = ""
-                    code = ""
-                    mail_ok = False
-                    max_mail_retry = 3
-                    for mail_try in range(1, max_mail_retry + 1):
-                        self.log(f"[*] 1. 打开注册页 (尝试 {mail_try}/{max_mail_retry})")
-                        open_signup_page(
-                            log_callback=self.log, cancel_callback=self.should_stop
-                        )
-                        self.log("[*] 2. 创建邮箱并提交")
-                        email, dev_token = fill_email_and_submit(
-                            log_callback=self.log, cancel_callback=self.should_stop
-                        )
-                        self.log(f"[*] 邮箱: {email}")
-                        self.log(f"[Debug] 邮箱credential(jwt): {dev_token}")
-                        try:
-                            with open(
-                                os.path.join(os.path.dirname(__file__), "mail_credentials.txt"),
-                                "a",
-                                encoding="utf-8",
-                            ) as f:
-                                f.write(f"{email}\t{dev_token}\n")
-                        except Exception:
-                            pass
-                        self.log("[*] 3. 拉取验证码")
-                        try:
-                            code = fill_code_and_submit(
-                                email,
-                                dev_token,
-                                log_callback=self.log,
-                                cancel_callback=self.should_stop,
-                            )
-                            mail_ok = True
-                            break
-                        except Exception as mail_exc:
-                            msg = str(mail_exc)
-                            if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
-                                self.log(f"[!] 本邮箱未取到验证码，自动更换新邮箱重试: {msg}")
-                                restart_browser(log_callback=self.log)
-                                sleep_with_cancel(1, self.should_stop)
-                                continue
-                            raise
+            conc = int(config.get("concurrency", 1) or 1)
+        except Exception:
+            conc = 1
 
-                    if not mail_ok:
-                        raise Exception("验证码阶段失败，已达到最大重试次数")
-                    self.log(f"[*] 验证码: {code}")
-                    self.log("[*] 4. 填写资料")
-                    profile = fill_profile_and_submit(
-                        log_callback=self.log, cancel_callback=self.should_stop
-                    )
-                    self.log(f"[*] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
-                    self.log("[*] 5. 等待 sso cookie")
-                    sso = wait_for_sso_cookie(
-                        log_callback=self.log, cancel_callback=self.should_stop
-                    )
-                    cpa_thread = None
-                    cpa_result_box = {}
-                    _cpa_page = page if page is not None else None
-                    if config.get("cpa_export_enabled", True):
-                        self.log("[*] 6. CPA xAI 导出 (OIDC refreshToken) — 复用注册浏览器")
-                        def _cpa_mint():
-                            try:
-                                cpa_result_box["result"] = export_cpa_xai_for_account(
-                                    email, profile.get("password", ""), sso=sso, log_callback=self.log, page=_cpa_page
-                                )
-                            except Exception as e:
-                                cpa_result_box["result"] = {"ok": False, "error": str(e)}
-                        cpa_thread = threading.Thread(target=_cpa_mint, daemon=True)
-                        cpa_thread.start()
-                    if config.get("enable_nsfw", True):
-                        self.log("[*] 6. 开启 NSFW")
-                        nsfw_ok, nsfw_msg = enable_nsfw_for_token(
-                            sso, log_callback=self.log
-                        )
-                        if nsfw_ok:
-                            self.log(f"[+] NSFW 开启成功: {nsfw_msg}")
-                        else:
-                            self.log(f"[!] NSFW 未开启，继续保存账号: {nsfw_msg}")
-                    if cpa_thread is not None:
-                        self.log("[*] 等待 CPA xAI 导出完成...")
-                        cpa_thread.join(timeout=float(config.get("cpa_mint_timeout_sec", 240) or 240))
-                        cpa_result = cpa_result_box.get("result", {"ok": False, "error": "timeout"})
-                        if cpa_result.get("ok"):
-                            self.log(f"[+] CPA xAI 导出成功: {cpa_result.get('path', '')}")
-                        elif cpa_result.get("skipped"):
-                            self.log(f"[cpa] CPA 导出已跳过")
-                        else:
-                            self.log(f"[!] CPA xAI 导出失败: {cpa_result.get('error', '未知错误')}")
-                    self.results.append({"email": email, "sso": sso, "profile": profile})
-                    try:
-                        line = f"{email}----{profile.get('password','')}----{sso}\n"
-                        with open(self.accounts_output_file, "a", encoding="utf-8") as f:
-                            f.write(line)
-                    except Exception as file_exc:
-                        self.log(f"[Debug] 保存账号文件失败: {file_exc}")
-                    add_token_to_grok2api_pools(sso, email=email, log_callback=self.log)
-                    add_token_to_token_only_file(sso, log_callback=self.log)
-                    self.success_count += 1
-                    retry_count_for_slot = 0
-                    i += 1
-                    self.log(f"[+] 注册成功: {email}")
-                    if (
-                        self.success_count > 0
-                        and self.success_count % MEMORY_CLEANUP_INTERVAL == 0
-                        and i < count
-                    ):
-                        cleanup_runtime_memory(
-                            log_callback=self.log,
-                            reason=f"已成功 {self.success_count} 个账号，执行定期清理",
-                        )
-                except RegistrationCancelled:
-                    self.log("[!] 注册被用户停止")
-                    break
-                except AccountRetryNeeded as exc:
-                    retry_count_for_slot += 1
-                    if retry_count_for_slot <= max_slot_retry:
-                        self.log(
-                            f"[!] 当前账号流程卡住，重试第 {retry_count_for_slot}/{max_slot_retry} 次: {exc}"
-                        )
-                    else:
-                        self.fail_count += 1
-                        self.log(
-                            f"[-] 当前账号已达到最大重试次数，跳过: {exc}"
-                        )
-                        retry_count_for_slot = 0
-                        i += 1
-                except Exception as exc:
-                    self.fail_count += 1
-                    retry_count_for_slot = 0
-                    i += 1
-                    self.log(f"[-] 注册失败: {exc}")
-                finally:
-                    self.update_stats()
-                    if self.should_stop():
-                        break
-                    if browser is None:
-                        start_browser(log_callback=self.log)
-                    else:
-                        restart_browser(log_callback=self.log)
-                    sleep_with_cancel(1, self.should_stop)
+        def _on_stats(success, fail):
+            self.success_count = success
+            self.fail_count = fail
+            self.update_stats()
+
+        try:
+            run_batch(
+                count,
+                self.log,
+                self.should_stop,
+                on_stats=_on_stats,
+                accounts_output_file=self.accounts_output_file,
+                concurrency=conc,
+            )
         except Exception as exc:
             self.log(f"[!] 任务异常: {exc}")
         finally:
@@ -3199,17 +4078,17 @@ class CliStopController:
         self.stop_requested = True
 
 
+_cli_log_lock = threading.Lock()
+
+
 def cli_log(message):
     timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-    print(f"[{timestamp}] {message}", flush=True)
+    with _cli_log_lock:
+        print(f"[{timestamp}] {message}", flush=True)
 
 
 def run_registration_cli(count):
     controller = CliStopController()
-    success_count = 0
-    fail_count = 0
-    retry_count_for_slot = 0
-    max_slot_retry = 3
     accounts_output_file = os.path.join(
         os.path.dirname(__file__),
         f"accounts_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
@@ -3217,156 +4096,30 @@ def run_registration_cli(count):
     cli_log(f"[*] 终端模式启动，目标数量: {count}")
     cli_log(f"[*] 成功账号将实时保存到: {accounts_output_file}")
     try:
-        start_browser(log_callback=cli_log)
-        cli_log("[*] 浏览器已启动")
-        i = 0
-        while i < count:
-            if controller.should_stop():
-                break
-            cli_log(f"--- 开始第 {i + 1}/{count} 个账号 ---")
-            try:
-                email = ""
-                dev_token = ""
-                code = ""
-                mail_ok = False
-                max_mail_retry = 3
-                for mail_try in range(1, max_mail_retry + 1):
-                    cli_log(f"[*] 1. 打开注册页 (尝试 {mail_try}/{max_mail_retry})")
-                    open_signup_page(
-                        log_callback=cli_log, cancel_callback=controller.should_stop
-                    )
-                    cli_log("[*] 2. 创建邮箱并提交")
-                    email, dev_token = fill_email_and_submit(
-                        log_callback=cli_log, cancel_callback=controller.should_stop
-                    )
-                    cli_log(f"[*] 邮箱: {email}")
-                    cli_log(f"[Debug] 邮箱credential(jwt): {dev_token}")
-                    try:
-                        with open(
-                            os.path.join(os.path.dirname(__file__), "mail_credentials.txt"),
-                            "a",
-                            encoding="utf-8",
-                        ) as f:
-                            f.write(f"{email}\t{dev_token}\n")
-                    except Exception:
-                        pass
-                    cli_log("[*] 3. 拉取验证码")
-                    try:
-                        code = fill_code_and_submit(
-                            email,
-                            dev_token,
-                            log_callback=cli_log,
-                            cancel_callback=controller.should_stop,
-                        )
-                        mail_ok = True
-                        break
-                    except Exception as mail_exc:
-                        msg = str(mail_exc)
-                        if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
-                            cli_log(f"[!] 本邮箱未取到验证码，自动更换新邮箱重试: {msg}")
-                            restart_browser(log_callback=cli_log)
-                            sleep_with_cancel(1, controller.should_stop)
-                            continue
-                        raise
-
-                if not mail_ok:
-                    raise Exception("验证码阶段失败，已达到最大重试次数")
-                cli_log(f"[*] 验证码: {code}")
-                cli_log("[*] 4. 填写资料")
-                profile = fill_profile_and_submit(
-                    log_callback=cli_log, cancel_callback=controller.should_stop
-                )
-                cli_log(f"[*] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
-                cli_log("[*] 5. 等待 sso cookie")
-                sso = wait_for_sso_cookie(
-                    log_callback=cli_log, cancel_callback=controller.should_stop
-                )
-                cpa_thread = None
-                cpa_result_box = {}
-                _cpa_page = page if page is not None else None
-                if config.get("cpa_export_enabled", True):
-                    cli_log("[*] 6. CPA xAI 导出 (OIDC refreshToken) — 复用注册浏览器")
-                    def _cpa_mint_cli():
-                        try:
-                            cpa_result_box["result"] = export_cpa_xai_for_account(
-                                email, profile.get("password", ""), sso=sso, log_callback=cli_log, page=_cpa_page
-                            )
-                        except Exception as e:
-                            cpa_result_box["result"] = {"ok": False, "error": str(e)}
-                    cpa_thread = threading.Thread(target=_cpa_mint_cli, daemon=True)
-                    cpa_thread.start()
-                if config.get("enable_nsfw", True):
-                    cli_log("[*] 6. 开启 NSFW")
-                    nsfw_ok, nsfw_msg = enable_nsfw_for_token(
-                        sso, log_callback=cli_log
-                    )
-                    if nsfw_ok:
-                        cli_log(f"[+] NSFW 开启成功: {nsfw_msg}")
-                    else:
-                        cli_log(f"[!] NSFW 未开启，继续保存账号: {nsfw_msg}")
-                if cpa_thread is not None:
-                    cli_log("[*] 等待 CPA xAI 导出完成...")
-                    cpa_thread.join(timeout=float(config.get("cpa_mint_timeout_sec", 240) or 240))
-                    cpa_result = cpa_result_box.get("result", {"ok": False, "error": "timeout"})
-                    if cpa_result.get("ok"):
-                        cli_log(f"[+] CPA xAI 导出成功: {cpa_result.get('path', '')}")
-                    elif cpa_result.get("skipped"):
-                        cli_log("[cpa] CPA 导出已跳过")
-                    else:
-                        cli_log(f"[!] CPA xAI 导出失败: {cpa_result.get('error', '未知错误')}")
-                try:
-                    line = f"{email}----{profile.get('password','')}----{sso}\n"
-                    with open(accounts_output_file, "a", encoding="utf-8") as f:
-                        f.write(line)
-                except Exception as file_exc:
-                    cli_log(f"[Debug] 保存账号文件失败: {file_exc}")
-                add_token_to_grok2api_pools(sso, email=email, log_callback=cli_log)
-                add_token_to_token_only_file(sso, log_callback=cli_log)
-                success_count += 1
-                retry_count_for_slot = 0
-                i += 1
-                cli_log(f"[+] 注册成功: {email}")
-                cli_log(f"[*] 当前统计: 成功 {success_count} | 失败 {fail_count}")
-                if success_count > 0 and success_count % MEMORY_CLEANUP_INTERVAL == 0 and i < count:
-                    cleanup_runtime_memory(
-                        log_callback=cli_log,
-                        reason=f"已成功 {success_count} 个账号，执行定期清理",
-                    )
-            except RegistrationCancelled:
-                cli_log("[!] 注册被停止")
-                break
-            except AccountRetryNeeded as exc:
-                retry_count_for_slot += 1
-                if retry_count_for_slot <= max_slot_retry:
-                    cli_log(
-                        f"[!] 当前账号流程卡住，重试第 {retry_count_for_slot}/{max_slot_retry} 次: {exc}"
-                    )
-                else:
-                    fail_count += 1
-                    retry_count_for_slot = 0
-                    i += 1
-                    cli_log(f"[-] 当前账号已达到最大重试次数，跳过: {exc}")
-            except Exception as exc:
-                fail_count += 1
-                retry_count_for_slot = 0
-                i += 1
-                cli_log(f"[-] 注册失败: {exc}")
-            finally:
-                if controller.should_stop():
-                    break
-                if browser is None:
-                    start_browser(log_callback=cli_log)
-                else:
-                    restart_browser(log_callback=cli_log)
-                sleep_with_cancel(1, controller.should_stop)
+        conc = int(config.get("concurrency", 1) or 1)
+    except Exception:
+        conc = 1
+    success = 0
+    fail = 0
+    try:
+        success, fail = run_batch(
+            count,
+            cli_log,
+            controller.should_stop,
+            on_stats=None,
+            accounts_output_file=accounts_output_file,
+            concurrency=conc,
+        )
     except KeyboardInterrupt:
         controller.stop()
         cli_log("[!] 收到 Ctrl+C，正在停止并清理")
+        force_stop_all_browsers()
     except Exception as exc:
         cli_log(f"[!] 任务异常: {exc}")
     finally:
-        cleanup_runtime_memory(log_callback=cli_log, reason="任务结束")
-        cli_log(f"[*] 任务结束。成功 {success_count} | 失败 {fail_count}")
+        force_stop_all_browsers()
+        stop_browser()
+        cli_log(f"[*] 任务结束。成功 {success} | 失败 {fail}")
 
 
 def main_cli():

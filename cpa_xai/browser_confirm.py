@@ -1037,14 +1037,22 @@ def approve_device_code(
                         log("filled user_code")
                 except Exception:
                     pass
-            if _click_exact(page, ["继续", "Continue"], log, real=False):
+            if _click_exact(page, ["继续", "Continue"], log, real=True):
                 _sleep(2.0)
                 continue
             try:
                 el = page.ele("css:button[type='submit']", timeout=0.5)
                 if el:
-                    el.click(by_js=True)
-                    log("clicked device submit")
+                    try:
+                        el.scroll.to_see()
+                    except Exception:
+                        pass
+                    try:
+                        el.click()
+                        log("clicked device submit (real)")
+                    except Exception:
+                        el.click(by_js=True)
+                        log("clicked device submit")
                     _sleep(2.0)
                     continue
             except Exception:

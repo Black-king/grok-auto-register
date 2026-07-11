@@ -54,6 +54,10 @@ Grok Register 是一个面向自动化流程研究、测试环境验证和个人
 - 支持成功账号实时写入 `accounts_*.txt`。
 - 支持将 SSO token 写入 grok2api 本地或远端池。
 - 支持注册后尝试开启 NSFW。
+- 支持浏览器指纹随机化（自洽受限：随机窗口视口/界面语言 + 隐藏自动化痕迹，保持真实 UA/平台/WebGL 以兼容 Cloudflare Turnstile），每账号独立、同账号内保持一致。
+- 支持单一代理或代理池轮换（含带认证代理），代理池模式下 IP 打不开/过不了 Cloudflare 时自动换下一个 IP 重试。
+- 支持多并发注册（多浏览器并行），与代理池协同：每个 worker 用不同出口 IP。
+- 支持 CPA(OIDC refreshToken) 导出开关，可跳过浏览器取 token 步骤。
 - 支持页面卡住检测、当前账号重试、浏览器重启和内存清理。
 
 ## 环境要求
@@ -95,7 +99,14 @@ cp config.example.json config.json
 | `templol_api_key` | TempMail.lol API Key；免费匿名模式留空，付费/自定义域名时填写 |
 | `templol_domains` | TempMail.lol 自定义域名，逗号分隔；支持 `*.example.com` 通配自动生成子域名；留空则用官方随机域名 |
 | `register_count` | 本次目标注册数量 |
-| `proxy` | 代理地址，可留空 |
+| `proxy` | 单一代理地址，可留空；支持带认证 `http://user:pass@host:port` |
+| `proxy_mode` | `single` 用 `proxy`；`pool` 用 `proxy_pool` 轮换 |
+| `proxy_pool` | 代理池，JSON 数组或逗号/换行分隔字符串，支持带认证代理 |
+| `proxy_pool_strategy` | `rotate` 顺序轮换 / `random` 随机 |
+| `anti_fingerprint` | 是否开启浏览器指纹随机化（自洽受限：随机视口/语言 + 隐藏自动化痕迹，不改 UA/平台/WebGL/Canvas），默认 `true` |
+| `max_ip_retry` | 代理池模式下单账号换 IP 重试上限（实际取 `min(池大小, 该值)`） |
+| `concurrency` | 并发 worker 数（默认 1）。每个 worker 各开一个浏览器；pool 模式下每 worker 用不同 IP，超过池大小的 worker 排队等空闲 IP |
+| `cpa_export_enabled` | 是否导出 CPA(OIDC refreshToken)，关闭则跳过浏览器取 token，仍写 token.json/tokens.txt/accounts |
 | `enable_nsfw` | 注册后是否尝试开启 NSFW |
 | `cloudflare_api_base` | Cloudflare 临时邮箱 API 地址 |
 | `cloudflare_api_key` | Cloudflare 临时邮箱接口密钥；默认匿名模式留空，admin 模式填 `ADMIN_PASSWORD` |
@@ -110,6 +121,32 @@ cp config.example.json config.json
 | `grok2api_auto_add_remote` | 是否写入远端 grok2api |
 | `grok2api_remote_base` | 远端 grok2api 地址，可填站点根地址或 `/admin/api` 管理 API 地址 |
 | `grok2api_remote_app_key` | 远端 grok2api app key |
+
+### 代理、指纹与 CPA 开关
+
+**代理模式**：默认 `single`，使用 `proxy` 字段（留空则直连）。切换到 `pool` 后从 `proxy_pool` 轮换出口 IP：
+
+```json
+{
+  "proxy_mode": "pool",
+  "proxy_pool": [
+    "http://user:pass@ip1:port",
+    "http://ip2:port",
+    "socks5://user:pass@ip3:port"
+  ],
+  "proxy_pool_strategy": "rotate"
+}
+```
+
+带认证代理（`user:pass`）会自动生成一个临时浏览器扩展注入凭据（Chromium 的 `--proxy-server` 本身不支持内嵌账号密码）。HTTP 请求（邮箱 API、开 NSFW、CPA）与浏览器走同一出口 IP。
+
+**换 IP 容错**：代理池模式下，若某 IP 打不开注册页或过不了 Cloudflare，会自动标记该 IP 失效、切换到下一个 IP 并重试当前账号，上限由 `max_ip_retry` 控制（实际取 `min(池大小, max_ip_retry)`）。单一代理模式无备用 IP，不触发切换。
+
+**并发注册**（`concurrency`，默认 1）：设为 N 后会启动 N 个 worker 线程，各自独立浏览器并行注册，账号数据（`accounts_*.txt`/`token.json`/`tokens.txt`）线程安全写入。**与代理池的配合**：pool 模式下每个并发 worker 从共享池领取一个「不同且未被占用」的出口 IP，并发数超过池大小时多出的 worker 排队等待空闲 IP；单一代理/直连模式允许多 worker 共享同一 IP 并发（同 IP 多开风险自负）。日志会带 `[W1]/[W2]` 前缀区分 worker。注意每个 worker 各开一个 Chromium，并发数受机器内存/CPU 限制，建议从 2–3 起步。
+
+**指纹随机化**（`anti_fingerprint`，默认开）：采用**自洽受限**策略——只随机"真实浏览器本就会变化、且不与其他信号冲突"的维度（**窗口视口、界面语言**），并隐藏自动化痕迹（`navigator.webdriver` 等）。**刻意不伪造 UA、`navigator.platform`、WebGL、Canvas**：这些一旦与真实 OS、client hints（`Sec-CH-UA-Platform`）、TLS/JA3 指纹不一致，反而会被 Cloudflare Turnstile 判定为机器人。多账号隔离主要依靠**代理池换 IP** + 每账号独立的临时会话（清空 cookie/缓存）。**同一账号的整个生命周期（注册→CPA 导出）使用同一套画像与同一 IP**，换账号才轮换。
+
+**CPA 导出开关**（`cpa_export_enabled`）：开启时注册成功后复用同一浏览器获取 OIDC refreshToken 并写入 `cpa_auths/`。关闭后**跳过该步骤、不生成 `cpa_auths` 文件**，但仍照常导出 `token.json`（grok2api 池）、`tokens.txt` 和 `accounts_*.txt`。适合只需要 SSO token、不需要 refreshToken 的场景。
 
 ### TempMail.lol 临时邮箱（推荐，默认零配置）
 
